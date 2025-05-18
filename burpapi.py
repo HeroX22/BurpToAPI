@@ -271,8 +271,9 @@ def xml_to_postman(xml_file, output_file=None, deduplicate=True, group_mode="pat
         },
         "item": []
     }
-    # Auth/header vars
     global_vars = {}
+    request_hashes = set()
+    duplicate_count = 0  # Tambahkan penghitung duplikat
     # Folder structure
     for folder, group_items in grouped.items():
         folder_item = {"name": folder, "item": []}
@@ -333,7 +334,6 @@ def xml_to_postman(xml_file, output_file=None, deduplicate=True, group_mode="pat
                     pm_item["request"]["body"] = {"mode": "urlencoded", "urlencoded": form_data}
                 else:
                     pm_item["request"]["body"] = {"mode": "raw", "raw": body}
-            # Multiple response example support
             if resp:
                 pm_item["response"] = [{
                     "name": f"Response {status}",
@@ -344,8 +344,22 @@ def xml_to_postman(xml_file, output_file=None, deduplicate=True, group_mode="pat
                     "header": [],
                     "body": resp
                 }]
+            # Deduplication logic
+            req_hash = generate_request_hash(
+                method,
+                url,
+                headers,
+                body
+            )
+            if deduplicate:
+                if req_hash in request_hashes:
+                    duplicate_count += 1  # Tambah jika duplikat
+                    continue
+                request_hashes.add(req_hash)
             folder_item["item"].append(pm_item)
-        postman_collection["item"].append(folder_item)
+        # Hanya tambahkan folder jika ada item di dalamnya
+        if folder_item["item"]:
+            postman_collection["item"].append(folder_item)
     # Add global variables
     if global_vars:
         postman_collection["variable"] = [{"key": k, "value": v} for k, v in global_vars.items()]
@@ -357,6 +371,8 @@ def xml_to_postman(xml_file, output_file=None, deduplicate=True, group_mode="pat
         postman_collection = update_postman_collection(output_file, [i for f in postman_collection["item"] for i in f["item"]])
     with open(output_file, 'w', encoding='utf-8') as f:
         json.dump(postman_collection, f, indent=2)
+    if deduplicate and duplicate_count > 0:
+        print(f"Removed {duplicate_count} duplicate request(s)")
     print(f"Successfully converted to Postman collection: {output_file}")
     return output_file
 
