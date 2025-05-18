@@ -7,6 +7,8 @@ import re
 import os
 import hashlib
 from urllib.parse import urlparse, parse_qs
+import glob
+from collections import defaultdict
 
 def decode_base64(data, is_base64):
     """Decode base64 data if necessary"""
@@ -97,16 +99,170 @@ def generate_request_hash(method, url, headers, body=None):
     # Generate SHA-256 hash
     return hashlib.sha256(hash_input.encode()).hexdigest()
 
-def xml_to_postman(xml_file, output_file=None, deduplicate=True):
-    """Convert Burp Suite XML to Postman Collection"""
-    try:
-        tree = ET.parse(xml_file)
-        root = tree.getroot()
-    except Exception as e:
-        print(f"Error parsing XML file: {e}")
-        return
+def detect_auth_headers(headers):
+    """Detect authentication headers and extract tokens/keys as variables."""
+    auth_vars = {}
+    for k, v in headers.items():
+        kl = k.lower()
+        if kl == "authorization":
+            if v.lower().startswith("bearer "):
+                auth_vars["bearer_token"] = v[7:]
+            else:
+                auth_vars["authorization"] = v
+        elif kl in ("x-api-key", "api-key", "x-access-token"):
+            auth_vars[kl.replace("-", "_")] = v
+    return auth_vars
 
-    # Create Postman collection structure
+def extract_variables_from_path(path):
+    """Convert numeric or UUID segments in path to Postman/OpenAPI variables."""
+    segments = path.strip("/").split("/")
+    new_segments = []
+    variables = []
+    for seg in segments:
+        if re.match(r"^\d+$", seg):
+            var = "id"
+            new_segments.append(f":{var}")
+            variables.append(var)
+        elif re.match(r"^[0-9a-fA-F-]{8,}$", seg):
+            var = "uuid"
+            new_segments.append(f":{var}")
+            variables.append(var)
+        else:
+            new_segments.append(seg)
+    return "/".join(new_segments), variables
+
+def group_by_path(items, mode="path_prefix"):
+    """Group items by path prefix or domain."""
+    grouped = defaultdict(list)
+    for item in items:
+        url = item.get("url")
+        parsed = urlparse(url)
+        if mode == "domain":
+            key = parsed.netloc
+        elif mode == "path_prefix":
+            prefix = parsed.path.strip("/").split("/")[0] if parsed.path.strip("/") else "root"
+            key = prefix
+        else:
+            key = "All"
+        grouped[key].append(item)
+    return grouped
+
+def parse_har_file(har_file):
+    """Parse HAR file and yield items similar to Burp XML."""
+    with open(har_file, "r", encoding="utf-8") as f:
+        har = json.load(f)
+    for entry in har["log"]["entries"]:
+        req = entry["request"]
+        resp = entry.get("response", {})
+        url = req["url"]
+        method = req["method"]
+        headers = {h["name"]: h["value"] for h in req.get("headers", [])}
+        body = req.get("postData", {}).get("text", "")
+        status = str(resp.get("status", ""))
+        resp_body = resp.get("content", {}).get("text", "")
+        resp_headers = {h["name"]: h["value"] for h in resp.get("headers", [])}
+        yield {
+            "url": url,
+            "method": method,
+            "headers": headers,
+            "body": body,
+            "status": status,
+            "response": resp_body,
+            "response_headers": resp_headers
+        }
+
+def update_postman_collection(existing_file, new_items):
+    """Update existing Postman collection with new items (avoid duplicates)."""
+    with open(existing_file, "r", encoding="utf-8") as f:
+        collection = json.load(f)
+    existing_hashes = set()
+    for item in collection.get("item", []):
+        if "request" in item:
+            req = item["request"]
+            url = req["url"]["raw"] if isinstance(req["url"], dict) else req["url"]
+            method = req["method"]
+            headers = {h["key"]: h["value"] for h in req.get("header", [])}
+            body = req.get("body", {}).get("raw", "")
+            h = generate_request_hash(method, url, headers, body)
+            existing_hashes.add(h)
+    for item in new_items:
+        h = generate_request_hash(item["request"]["method"], item["request"]["url"]["raw"], {h["key"]: h["value"] for h in item["request"].get("header", [])}, item["request"].get("body", {}).get("raw", ""))
+        if h not in existing_hashes:
+            collection["item"].append(item)
+    return collection
+
+def export_insomnia(items, output_file):
+    """Export items to Insomnia format."""
+    insomnia = {
+        "_type": "export",
+        "__export_format": 4,
+        "__export_date": "",
+        "resources": []
+    }
+    for idx, item in enumerate(items):
+        req = item["request"]
+        url = req["url"]["raw"] if isinstance(req["url"], dict) else req["url"]
+        headers = [{"name": h["key"], "value": h["value"]} for h in req.get("header",[])]
+        body = req.get("body", {}).get("raw", "")
+        insomnia["resources"].append({
+            "_id": f"req_{idx}",
+            "parentId": "wrk_1",
+            "_type": "request",
+            "name": item["name"],
+            "method": req["method"],
+            "url": url,
+            "body": {"mimeType": "application/json", "text": body} if body else {},
+            "headers": headers
+        })
+    with open(output_file, "w", encoding="utf-8") as f:
+        json.dump(insomnia, f, indent=2)
+    print(f"Exported to Insomnia: {output_file}")
+
+def xml_to_postman(xml_file, output_file=None, deduplicate=True, group_mode="path_prefix", update=False, input_type="xml"):
+    """Convert Burp Suite XML or HAR to Postman Collection with grouping and enhanced features."""
+    items = []
+    if input_type == "har":
+        for item in parse_har_file(xml_file):
+            items.append(item)
+    else:
+        try:
+            tree = ET.parse(xml_file)
+            root = tree.getroot()
+        except Exception as e:
+            print(f"Error parsing XML file: {e}")
+            return
+        for item in root.findall(".//item"):
+            url_element = item.find("url")
+            method_element = item.find("method")
+            request_element = item.find("request")
+            status_element = item.find("status")
+            response_element = item.find("response")
+            if url_element is None or request_element is None:
+                continue
+            url = url_element.text
+            method = method_element.text if method_element is not None else "GET"
+            is_request_base64 = request_element.get("base64", "false")
+            raw_request = decode_base64(request_element.text, is_request_base64)
+            request_lines = raw_request.split('\n')
+            first_line = request_lines[0] if request_lines else ""
+            req_method, req_path = parse_request_line(first_line)
+            if req_method:
+                method = req_method
+            headers = parse_headers(raw_request)
+            body = extract_request_body(raw_request)
+            status = status_element.text if status_element is not None else ""
+            resp = decode_base64(response_element.text, response_element.get("base64", "false")) if response_element is not None else ""
+            items.append({
+                "url": url,
+                "method": method,
+                "headers": headers,
+                "body": body,
+                "status": status,
+                "response": resp
+            })
+
+    # Grouping
+    grouped = group_by_path(items, mode=group_mode)
     postman_collection = {
         "info": {
             "name": f"Converted from {os.path.basename(xml_file)}",
@@ -115,170 +271,140 @@ def xml_to_postman(xml_file, output_file=None, deduplicate=True):
         },
         "item": []
     }
-
-    # Track request hashes to avoid duplicates if deduplication is enabled
-    request_hashes = set()
-    duplicate_count = 0
-
-    # Process each item in the Burp Suite XML
-    for item in root.findall(".//item"):
-        try:
-            url_element = item.find("url")
-            host_element = item.find("host")
-            method_element = item.find("method")
-            path_element = item.find("path")
-            request_element = item.find("request")
-            status_element = item.find("status")
-            response_element = item.find("response")
-            
-            if url_element is None or request_element is None:
-                print("Warning: Missing required elements, skipping item")
-                continue
-                
-            url = url_element.text
-            method = method_element.text if method_element is not None else "GET"
-            
-            # Process request
-            is_request_base64 = request_element.get("base64", "false")
-            raw_request = decode_base64(request_element.text, is_request_base64)
-            
-            # Parse request
-            request_lines = raw_request.split('\n')
-            first_line = request_lines[0] if request_lines else ""
-            req_method, req_path = parse_request_line(first_line)
-            
-            # Use parsed method if available, fallback to XML method
-            if req_method:
-                method = req_method
-                
-            headers = parse_headers(raw_request)
-            body = extract_request_body(raw_request)
-            
-            # Check for duplicates if deduplication is enabled
-            if deduplicate:
-                request_hash = generate_request_hash(method, url, headers, body)
-                if request_hash in request_hashes:
-                    duplicate_count += 1
-                    continue  # Skip this duplicate request
-                request_hashes.add(request_hash)
-            
-            # Parse URL components
+    # Auth/header vars
+    global_vars = {}
+    # Folder structure
+    for folder, group_items in grouped.items():
+        folder_item = {"name": folder, "item": []}
+        for entry in group_items:
+            url = entry["url"]
+            method = entry["method"]
+            headers = entry["headers"]
+            body = entry["body"]
+            status = entry.get("status", "")
+            resp = entry.get("response", "")
+            # Auth/header extraction
+            auth_vars = detect_auth_headers(headers)
+            global_vars.update(auth_vars)
+            # Path variable extraction
             parsed_url = urlparse(url)
+            path, path_vars = extract_variables_from_path(parsed_url.path)
             protocol = parsed_url.scheme
-            host = parsed_url.netloc
-            path = parsed_url.path
+            host = parsed_url.netloc.split('.')
             query = parsed_url.query
-            
-            # Create Postman request item
-            postman_item = {
-                "name": f"{method} {path}",
+            # Build Postman item
+            pm_item = {
+                "name": f"{method} {parsed_url.path}",
                 "request": {
                     "method": method,
                     "header": [{"key": k, "value": v} for k, v in headers.items()],
                     "url": {
                         "raw": url,
                         "protocol": protocol,
-                        "host": host.split('.'),
+                        "host": host,
                         "path": path.strip('/').split('/') if path else [],
                     }
-                }
+                },
+                "description": f"Auto-generated endpoint for `{method} {parsed_url.path}`.\n\nStatus: {status}"
             }
-            
-            # Add query parameters if present
             if query:
                 query_params = parse_qs(query)
-                postman_item["request"]["url"]["query"] = [
+                pm_item["request"]["url"]["query"] = [
                     {"key": k, "value": v[0]} for k, v in query_params.items()
                 ]
-            
-            # Add request body if present
             if body and method not in ["GET", "HEAD"]:
                 content_type = headers.get("Content-Type", "")
                 if "application/json" in content_type:
                     try:
                         json_body = json.loads(body)
-                        postman_item["request"]["body"] = {
+                        pm_item["request"]["body"] = {
                             "mode": "raw",
                             "raw": json.dumps(json_body, indent=2),
-                            "options": {
-                                "raw": {
-                                    "language": "json"
-                                }
-                            }
+                            "options": {"raw": {"language": "json"}}
                         }
                     except:
-                        # Fallback to raw if not valid JSON
-                        postman_item["request"]["body"] = {
-                            "mode": "raw",
-                            "raw": body
-                        }
+                        pm_item["request"]["body"] = {"mode": "raw", "raw": body}
                 elif "application/x-www-form-urlencoded" in content_type:
                     form_data = []
                     for param in body.split('&'):
                         if '=' in param:
                             key, value = param.split('=', 1)
                             form_data.append({"key": key, "value": value})
-                    postman_item["request"]["body"] = {
-                        "mode": "urlencoded",
-                        "urlencoded": form_data
-                    }
-                elif "multipart/form-data" in content_type:
-                    # Simplified handling - multipart boundaries would need more complex parsing
-                    postman_item["request"]["body"] = {
-                        "mode": "formdata",
-                        "formdata": []
-                    }
+                    pm_item["request"]["body"] = {"mode": "urlencoded", "urlencoded": form_data}
                 else:
-                    postman_item["request"]["body"] = {
-                        "mode": "raw",
-                        "raw": body
-                    }
-            
-            # Add response if available
-            if response_element is not None and status_element is not None:
-                is_response_base64 = response_element.get("base64", "false")
-                raw_response = decode_base64(response_element.text, is_response_base64)
-                
-                postman_item["response"] = [{
-                    "name": f"Response {status_element.text}",
-                    "originalRequest": postman_item["request"],
-                    "status": status_element.text,
-                    "code": int(status_element.text) if status_element.text.isdigit() else 0,
+                    pm_item["request"]["body"] = {"mode": "raw", "raw": body}
+            # Multiple response example support
+            if resp:
+                pm_item["response"] = [{
+                    "name": f"Response {status}",
+                    "originalRequest": pm_item["request"],
+                    "status": status,
+                    "code": int(status) if status.isdigit() else 0,
                     "_postman_previewlanguage": "json",
-                    "header": [],  # Would need to parse from raw_response
-                    "body": raw_response
+                    "header": [],
+                    "body": resp
                 }]
-            
-            postman_collection["item"].append(postman_item)
-            
-        except Exception as e:
-            print(f"Error processing item: {e}")
-            continue
-
-    # Save to file
+            folder_item["item"].append(pm_item)
+        postman_collection["item"].append(folder_item)
+    # Add global variables
+    if global_vars:
+        postman_collection["variable"] = [{"key": k, "value": v} for k, v in global_vars.items()]
+    # Output/update
     if output_file is None:
         base_name = os.path.splitext(os.path.basename(xml_file))[0]
         output_file = f"{base_name}_postman_collection.json"
-    
+    if update and os.path.exists(output_file):
+        postman_collection = update_postman_collection(output_file, [i for f in postman_collection["item"] for i in f["item"]])
     with open(output_file, 'w', encoding='utf-8') as f:
         json.dump(postman_collection, f, indent=2)
-    
-    if deduplicate and duplicate_count > 0:
-        print(f"Removed {duplicate_count} duplicate request(s)")
-        
     print(f"Successfully converted to Postman collection: {output_file}")
     return output_file
 
-def xml_to_openapi(xml_file, output_file=None, deduplicate=True):
-    """Convert Burp Suite XML to OpenAPI Specification"""
-    try:
-        tree = ET.parse(xml_file)
-        root = tree.getroot()
-    except Exception as e:
-        print(f"Error parsing XML file: {e}")
-        return
-
-    # Create OpenAPI specification structure
+def xml_to_openapi(xml_file, output_file=None, deduplicate=True, group_mode="path_prefix", input_type="xml"):
+    """Convert Burp Suite XML or HAR to OpenAPI Specification with tags and enhanced docs."""
+    # ...existing code...
+    # Replace the main loop with grouping and tag support
+    items = []
+    if input_type == "har":
+        for item in parse_har_file(xml_file):
+            items.append(item)
+    else:
+        try:
+            tree = ET.parse(xml_file)
+            root = tree.getroot()
+        except Exception as e:
+            print(f"Error parsing XML file: {e}")
+            return
+        for item in root.findall(".//item"):
+            url_element = item.find("url")
+            method_element = item.find("method")
+            request_element = item.find("request")
+            status_element = item.find("status")
+            response_element = item.find("response")
+            if url_element is None or request_element is None:
+                continue
+            url = url_element.text
+            method = method_element.text if method_element is not None else "GET"
+            is_request_base64 = request_element.get("base64", "false")
+            raw_request = decode_base64(request_element.text, is_request_base64)
+            request_lines = raw_request.split('\n')
+            first_line = request_lines[0] if request_lines else ""
+            req_method, req_path = parse_request_line(first_line)
+            if req_method:
+                method = req_method
+            headers = parse_headers(raw_request)
+            body = extract_request_body(raw_request)
+            status = status_element.text if status_element is not None else ""
+            resp = decode_base64(response_element.text, response_element.get("base64", "false")) if response_element is not None else ""
+            items.append({
+                "url": url,
+                "method": method,
+                "headers": headers,
+                "body": body,
+                "status": status,
+                "response": resp
+            })
+    grouped = group_by_path(items, mode=group_mode)
     openapi_spec = {
         "openapi": "3.0.0",
         "info": {
@@ -287,258 +413,169 @@ def xml_to_openapi(xml_file, output_file=None, deduplicate=True):
             "version": "1.0.0"
         },
         "servers": [],
-        "paths": {}
+        "paths": {},
+        "tags": []
     }
-    
-    # Track unique server URLs
     servers = set()
-    
-    # Track request hashes to avoid duplicates if deduplication is enabled
-    request_hashes = set()
-    duplicate_count = 0
-    endpoint_methods = set()  # Track endpoint+method combinations for OpenAPI
-
-    # Process each item in the Burp Suite XML
-    for item in root.findall(".//item"):
-        try:
-            url_element = item.find("url")
-            method_element = item.find("method")
-            request_element = item.find("request")
-            response_element = item.find("response")
-            status_element = item.find("status")
-            
-            if url_element is None or method_element is None:
-                continue
-                
-            url = url_element.text
-            method = method_element.text.lower()
-            
-            # Parse URL to get base URL and path
+    tag_set = set()
+    for folder, group_items in grouped.items():
+        tag_set.add(folder)
+        for entry in group_items:
+            url = entry["url"]
+            method = entry["method"].lower()
+            headers = entry["headers"]
+            body = entry["body"]
+            status = entry.get("status", "")
+            resp = entry.get("response", "")
             parsed_url = urlparse(url)
             server_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
-            path = parsed_url.path
-            
-            # Process request to check for duplicates
-            headers = {}
-            body = ""
-            if request_element is not None:
-                is_request_base64 = request_element.get("base64", "false")
-                raw_request = decode_base64(request_element.text, is_request_base64)
-                headers = parse_headers(raw_request)
-                body = extract_request_body(raw_request)
-            
-            # Skip duplicate requests if deduplication is enabled
-            if deduplicate:
-                request_hash = generate_request_hash(method, url, headers, body)
-                if request_hash in request_hashes:
-                    duplicate_count += 1
-                    continue  # Skip this duplicate request
-                request_hashes.add(request_hash)
-            
-            # For OpenAPI, handle path+method combination deduplication
-            endpoint_key = f"{method}:{path}"
-            if endpoint_key in endpoint_methods:
-                continue  # Skip if we already have this path+method combination
-            endpoint_methods.add(endpoint_key)
-            
-            # Add server if new
             if server_url not in servers:
                 servers.add(server_url)
                 openapi_spec["servers"].append({"url": server_url})
-            
-            # Process request
+            path, path_vars = extract_variables_from_path(parsed_url.path)
+            # Path variable OpenAPI
+            openapi_path = "/" + re.sub(r":(\w+)", r"{\1}", path)
+            if openapi_path not in openapi_spec["paths"]:
+                openapi_spec["paths"][openapi_path] = {}
             parameters = []
+            for var in path_vars:
+                parameters.append({
+                    "name": var,
+                    "in": "path",
+                    "required": True,
+                    "schema": {"type": "string"}
+                })
+            if parsed_url.query:
+                query_params = parse_qs(parsed_url.query)
+                for param_name, param_values in query_params.items():
+                    parameters.append({
+                        "name": param_name,
+                        "in": "query",
+                        "required": False,
+                        "schema": {"type": "string"},
+                        "example": param_values[0] if param_values else ""
+                    })
+            content_type = headers.get("Content-Type", "")
             request_body = None
-            
-            if request_element is not None:
-                is_request_base64 = request_element.get("base64", "false")
-                raw_request = decode_base64(request_element.text, is_request_base64)
-                
-                # Extract query parameters
-                if parsed_url.query:
-                    query_params = parse_qs(parsed_url.query)
-                    for param_name, param_values in query_params.items():
-                        parameters.append({
-                            "name": param_name,
-                            "in": "query",
-                            "required": False,
-                            "schema": {
-                                "type": "string"
-                            },
-                            "example": param_values[0] if param_values else ""
-                        })
-                
-                # Parse headers for content type
-                headers = parse_headers(raw_request)
-                content_type = headers.get("Content-Type", "")
-                
-                # Extract request body for non-GET methods
-                if method not in ["get", "head"]:
-                    body = extract_request_body(raw_request)
-                    if body:
-                        if "application/json" in content_type:
-                            try:
-                                json_body = json.loads(body)
-                                request_body = {
-                                    "content": {
-                                        "application/json": {
-                                            "schema": {
-                                                "type": "object"
-                                            },
-                                            "example": json_body
-                                        }
-                                    }
-                                }
-                            except:
-                                # Fallback for invalid JSON
-                                request_body = {
-                                    "content": {
-                                        "text/plain": {
-                                            "schema": {
-                                                "type": "string"
-                                            },
-                                            "example": body
-                                        }
-                                    }
-                                }
-                        elif "application/x-www-form-urlencoded" in content_type:
-                            form_params = {}
-                            for param in body.split('&'):
-                                if '=' in param:
-                                    key, value = param.split('=', 1)
-                                    form_params[key] = value
-                                    
-                            request_body = {
-                                "content": {
-                                    "application/x-www-form-urlencoded": {
-                                        "schema": {
-                                            "type": "object",
-                                            "properties": {k: {"type": "string"} for k in form_params.keys()}
-                                        },
-                                        "example": form_params
-                                    }
-                                }
-                            }
-                        else:
-                            request_body = {
-                                "content": {
-                                    content_type or "text/plain": {
-                                        "schema": {
-                                            "type": "string"
-                                        }
-                                    }
-                                }
-                            }
-            
-            # Set up response structure
-            responses = {
-                "default": {
-                    "description": "Default response"
-                }
-            }
-            
-            # Add actual response if available
-            if response_element is not None and status_element is not None:
-                status_code = status_element.text
-                is_response_base64 = response_element.get("base64", "false")
-                raw_response = decode_base64(response_element.text, is_response_base64)
-                
-                # Parse response content type
-                response_content_type = "application/json"  # Default
-                response_lines = raw_response.split('\n')
-                for line in response_lines:
-                    if line.lower().startswith("content-type:"):
-                        response_content_type = line.split(':', 1)[1].strip()
-                        break
-                
-                # Try to extract JSON from response body
-                response_body = raw_response.split('\n\n', 1)[-1] if '\n\n' in raw_response else raw_response
-                
-                if "application/json" in response_content_type:
+            if method not in ["get", "head"] and body:
+                if "application/json" in content_type:
                     try:
-                        # Try to find JSON content in the response
-                        json_match = re.search(r'(\{.*\}|\[.*\])', response_body, re.DOTALL)
-                        if json_match:
-                            json_body = json.loads(json_match.group(0))
-                            example = json_body
-                        else:
-                            example = response_body
+                        json_body = json.loads(body)
+                        request_body = {
+                            "content": {
+                                "application/json": {
+                                    "schema": {"type": "object"},
+                                    "example": json_body
+                                }
+                            }
+                        }
                     except:
-                        example = response_body
-                        
-                    responses[status_code] = {
-                        "description": f"Status {status_code} response",
-                        "content": {
-                            "application/json": {
-                                "schema": {
-                                    "type": "object"
-                                },
-                                "example": example
+                        request_body = {
+                            "content": {
+                                "text/plain": {
+                                    "schema": {"type": "string"},
+                                    "example": body
+                                }
                             }
                         }
-                    }
                 else:
-                    responses[status_code] = {
-                        "description": f"Status {status_code} response",
+                    request_body = {
                         "content": {
-                            response_content_type: {
-                                "schema": {
-                                    "type": "string"
-                                },
-                                "example": response_body
+                            content_type or "text/plain": {
+                                "schema": {"type": "string"},
+                                "example": body
                             }
                         }
                     }
-            
-            # Create path item
-            if path not in openapi_spec["paths"]:
-                openapi_spec["paths"][path] = {}
-                
-            # Add method to path
+            # Multiple response example support
+            responses = {}
+            if resp:
+                responses[status or "default"] = {
+                    "description": f"Status {status} response",
+                    "content": {
+                        content_type or "application/json": {
+                            "schema": {"type": "string"},
+                            "example": resp
+                        }
+                    }
+                }
+            else:
+                responses["default"] = {"description": "Default response"}
             path_item = {
-                "summary": f"{method.upper()} {path}",
+                "summary": f"{method.upper()} {openapi_path}",
+                "description": f"Auto-generated endpoint for `{method.upper()} {openapi_path}`.",
+                "tags": [folder],
                 "parameters": parameters,
                 "responses": responses
             }
-            
             if request_body:
                 path_item["requestBody"] = request_body
-                
-            openapi_spec["paths"][path][method] = path_item
-            
-        except Exception as e:
-            print(f"Error processing item for OpenAPI: {e}")
-            continue
-
-    # Save to file
+            openapi_spec["paths"][openapi_path][method] = path_item
+    openapi_spec["tags"] = [{"name": t} for t in tag_set]
     if output_file is None:
         base_name = os.path.splitext(os.path.basename(xml_file))[0]
         output_file = f"{base_name}_openapi.json"
-    
     with open(output_file, 'w', encoding='utf-8') as f:
         json.dump(openapi_spec, f, indent=2)
-    
-    if deduplicate and duplicate_count > 0:
-        print(f"Removed {duplicate_count} duplicate request(s)")
-        
     print(f"Successfully converted to OpenAPI specification: {output_file}")
     return output_file
 
 def main():
-    parser = argparse.ArgumentParser(description="Convert Burp Suite XML to Postman Collection or OpenAPI Specification")
-    parser.add_argument("input_file", help="Input Burp Suite XML file")
-    parser.add_argument("--format", choices=["postman", "openapi"], default="postman", help="Output format (default: postman)")
+    parser = argparse.ArgumentParser(description="Convert Burp Suite XML/HAR to Postman, OpenAPI, or Insomnia")
+    parser.add_argument("input_file", nargs="+", help="Input Burp Suite XML/HAR file(s) (wildcard supported)")
+    parser.add_argument("--format", choices=["postman", "openapi", "insomnia"], default="postman", help="Output format")
     parser.add_argument("--output", help="Output file name (default: auto-generated based on input file)")
-    parser.add_argument("--no-deduplicate", dest="deduplicate", action="store_false", 
-                      help="Disable deduplication of similar requests (default: deduplication enabled)")
+    parser.add_argument("--no-deduplicate", dest="deduplicate", action="store_false", help="Disable deduplication")
+    parser.add_argument("--group", choices=["domain", "path_prefix", "flat"], default="path_prefix", help="Grouping mode")
+    parser.add_argument("--input-type", choices=["xml", "har"], default="xml", help="Input file type")
+    parser.add_argument("--update", action="store_true", help="Update existing collection instead of overwrite")
     parser.set_defaults(deduplicate=True)
-    
     args = parser.parse_args()
-    
-    if args.format == "postman":
-        xml_to_postman(args.input_file, args.output, args.deduplicate)
-    else:
-        xml_to_openapi(args.input_file, args.output, args.deduplicate)
+    files = []
+    for pattern in args.input_file:
+        files.extend(glob.glob(pattern))
+    for f in files:
+        if args.format == "postman":
+            xml_to_postman(f, args.output, args.deduplicate, group_mode=args.group, update=args.update, input_type=args.input_type)
+        elif args.format == "openapi":
+            xml_to_openapi(f, args.output, args.deduplicate, group_mode=args.group, input_type=args.input_type)
+        elif args.format == "insomnia":
+            # Convert to Postman first, then to Insomnia
+            pm_file = xml_to_postman(f, None, args.deduplicate, group_mode=args.group, input_type=args.input_type)
+            with open(pm_file, "r", encoding="utf-8") as pf:
+                pm = json.load(pf)
+            items = []
+            for folder in pm.get("item", []):
+                if "item" in folder:
+                    items.extend(folder["item"])
+                else:
+                    items.append(folder)
+            export_insomnia(items, args.output or f"{os.path.splitext(os.path.basename(f))[0]}_insomnia.json")
 
 if __name__ == "__main__":
     main()
+
+# -------------------------------
+# Contoh Penggunaan:
+#
+# 1. Konversi satu file XML Burp ke Postman, otomatis folder per prefix path:
+#    python burpapi.py hasil.xml --format postman
+#
+# 2. Konversi beberapa file sekaligus (wildcard), hasilkan OpenAPI, group per domain:
+#    python burpapi.py hasil*.xml --format openapi --group domain
+#
+# 3. Import file HAR dan ekspor ke Insomnia:
+#    python burpapi.py traffic.har --input-type har --format insomnia
+#
+# 4. Update koleksi Postman yang sudah ada:
+#    python burpapi.py hasil.xml --format postman --update --output koleksi.json
+#
+# 5. Group flat (semua endpoint dalam satu folder):
+#    python burpapi.py hasil.xml --group flat
+#
+# 6. Konversi dengan variabel header/token otomatis:
+#    python burpapi.py hasil.xml --format postman
+#
+# Lihat --help untuk opsi lengkap:
+#    python burpapi.py --help
+# -------------------------------
