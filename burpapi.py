@@ -273,27 +273,28 @@ def xml_to_postman(xml_file, output_file=None, deduplicate=True, group_mode="pat
     }
     global_vars = {}
     request_hashes = set()
-    duplicate_count = 0  # Tambahkan penghitung duplikat
+    duplicate_count = 0
+
+    # Sort folder/group keys for consistent order
+    sorted_folders = sorted(grouped.keys()) if group_mode != "flat" else ["All"]
+
     # Folder structure
-    for folder, group_items in grouped.items():
-        folder_item = {"name": folder, "item": []}
-        for entry in group_items:
+    if group_mode == "flat":
+        flat_items = []
+        for entry in grouped.get("All", []) if "All" in grouped else [i for g in grouped.values() for i in g]:
             url = entry["url"]
             method = entry["method"]
             headers = entry["headers"]
             body = entry["body"]
             status = entry.get("status", "")
             resp = entry.get("response", "")
-            # Auth/header extraction
             auth_vars = detect_auth_headers(headers)
             global_vars.update(auth_vars)
-            # Path variable extraction
             parsed_url = urlparse(url)
             path, path_vars = extract_variables_from_path(parsed_url.path)
             protocol = parsed_url.scheme
             host = parsed_url.netloc.split('.')
             query = parsed_url.query
-            # Build Postman item
             pm_item = {
                 "name": f"{method} {parsed_url.path}",
                 "request": {
@@ -344,22 +345,98 @@ def xml_to_postman(xml_file, output_file=None, deduplicate=True, group_mode="pat
                     "header": [],
                     "body": resp
                 }]
-            # Deduplication logic
-            req_hash = generate_request_hash(
-                method,
-                url,
-                headers,
-                body
-            )
+            req_hash = generate_request_hash(method, url, headers, body)
             if deduplicate:
                 if req_hash in request_hashes:
-                    duplicate_count += 1  # Tambah jika duplikat
+                    duplicate_count += 1
                     continue
                 request_hashes.add(req_hash)
-            folder_item["item"].append(pm_item)
-        # Hanya tambahkan folder jika ada item di dalamnya
-        if folder_item["item"]:
-            postman_collection["item"].append(folder_item)
+            flat_items.append(pm_item)
+        # Sort flat_items by method then path
+        flat_items.sort(key=lambda x: (x["request"]["method"], "/".join(x["request"]["url"].get("path", []))))
+        postman_collection["item"].extend(flat_items)
+    else:
+        for folder in sorted_folders:
+            group_items = grouped[folder]
+            folder_item = {"name": folder, "item": []}
+            pm_items = []
+            for entry in group_items:
+                url = entry["url"]
+                method = entry["method"]
+                headers = entry["headers"]
+                body = entry["body"]
+                status = entry.get("status", "")
+                resp = entry.get("response", "")
+                auth_vars = detect_auth_headers(headers)
+                global_vars.update(auth_vars)
+                parsed_url = urlparse(url)
+                path, path_vars = extract_variables_from_path(parsed_url.path)
+                protocol = parsed_url.scheme
+                host = parsed_url.netloc.split('.')
+                query = parsed_url.query
+                pm_item = {
+                    "name": f"{method} {parsed_url.path}",
+                    "request": {
+                        "method": method,
+                        "header": [{"key": k, "value": v} for k, v in headers.items()],
+                        "url": {
+                            "raw": url,
+                            "protocol": protocol,
+                            "host": host,
+                            "path": path.strip('/').split('/') if path else [],
+                        }
+                    },
+                    "description": f"Auto-generated endpoint for `{method} {parsed_url.path}`.\n\nStatus: {status}"
+                }
+                if query:
+                    query_params = parse_qs(query)
+                    pm_item["request"]["url"]["query"] = [
+                        {"key": k, "value": v[0]} for k, v in query_params.items()
+                    ]
+                if body and method not in ["GET", "HEAD"]:
+                    content_type = headers.get("Content-Type", "")
+                    if "application/json" in content_type:
+                        try:
+                            json_body = json.loads(body)
+                            pm_item["request"]["body"] = {
+                                "mode": "raw",
+                                "raw": json.dumps(json_body, indent=2),
+                                "options": {"raw": {"language": "json"}}
+                            }
+                        except:
+                            pm_item["request"]["body"] = {"mode": "raw", "raw": body}
+                    elif "application/x-www-form-urlencoded" in content_type:
+                        form_data = []
+                        for param in body.split('&'):
+                            if '=' in param:
+                                key, value = param.split('=', 1)
+                                form_data.append({"key": key, "value": value})
+                        pm_item["request"]["body"] = {"mode": "urlencoded", "urlencoded": form_data}
+                    else:
+                        pm_item["request"]["body"] = {"mode": "raw", "raw": body}
+                if resp:
+                    pm_item["response"] = [{
+                        "name": f"Response {status}",
+                        "originalRequest": pm_item["request"],
+                        "status": status,
+                        "code": int(status) if status.isdigit() else 0,
+                        "_postman_previewlanguage": "json",
+                        "header": [],
+                        "body": resp
+                    }]
+                req_hash = generate_request_hash(method, url, headers, body)
+                if deduplicate:
+                    if req_hash in request_hashes:
+                        duplicate_count += 1
+                        continue
+                    request_hashes.add(req_hash)
+                pm_items.append(pm_item)
+            # Sort pm_items by method then path
+            pm_items.sort(key=lambda x: (x["request"]["method"], "/".join(x["request"]["url"].get("path", []))))
+            if pm_items:
+                folder_item["item"] = pm_items
+                postman_collection["item"].append(folder_item)
+
     # Add global variables
     if global_vars:
         postman_collection["variable"] = [{"key": k, "value": v} for k, v in global_vars.items()]
@@ -368,7 +445,7 @@ def xml_to_postman(xml_file, output_file=None, deduplicate=True, group_mode="pat
         base_name = os.path.splitext(os.path.basename(xml_file))[0]
         output_file = f"{base_name}_postman_collection.json"
     if update and os.path.exists(output_file):
-        postman_collection = update_postman_collection(output_file, [i for f in postman_collection["item"] for i in f["item"]])
+        postman_collection = update_postman_collection(output_file, [i for f in postman_collection["item"] for i in (f["item"] if "item" in f else [f])])
     with open(output_file, 'w', encoding='utf-8') as f:
         json.dump(postman_collection, f, indent=2)
     if deduplicate and duplicate_count > 0:
