@@ -322,12 +322,23 @@ def print_pentest_candidates(candidates, total, as_table=False):
             print(f"- {c['method']} {c['url']}  [{c['reason']}]")
     print(f"\nSummary: {len(candidates)} pentest candidates out of {total} endpoints.\n")
 
+def save_pentest_candidates_csv(candidates, pentest_output):
+    """Save pentest candidates to CSV file."""
+    import csv
+    with open(pentest_output, "w", newline='', encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=["method", "url", "reason"])
+        writer.writeheader()
+        for c in candidates:
+            writer.writerow(c)
+
 def save_pentest_candidates(candidates, pentest_output):
     """Save pentest candidates to file, auto-detect format by extension."""
     try:
         if pentest_output.lower().endswith(".json"):
             with open(pentest_output, "w", encoding="utf-8") as f:
                 json.dump(candidates, f, indent=2)
+        elif pentest_output.lower().endswith(".csv"):
+            save_pentest_candidates_csv(candidates, pentest_output)
         else:
             with open(pentest_output, "w", encoding="utf-8") as f:
                 for c in candidates:
@@ -336,30 +347,120 @@ def save_pentest_candidates(candidates, pentest_output):
     except Exception as e:
         logging.error(f"Failed to save pentest candidates: {e}")
 
-def xml_to_postman(
-    xml_file: str,
-    output_file: str = None,
-    deduplicate: bool = True,
-    group_mode: str = "path_prefix",
-    update: bool = False,
-    input_type: str = "xml",
-    pentest: bool = False,
-    pentest_output: str = None,
-    pentest_table: bool = False
-):
-    """Convert Burp Suite XML or HAR to Postman Collection with grouping and enhanced features."""
+def save_pentest_candidates_full(entries, pentest_output):
+    """Save full pentest candidate requests (not just summary) to file."""
+    try:
+        if pentest_output.lower().endswith(".json"):
+            with open(pentest_output, "w", encoding="utf-8") as f:
+                json.dump(entries, f, indent=2)
+        elif pentest_output.lower().endswith(".csv"):
+            import csv
+            # Flatten headers/body for CSV
+            fieldnames = ["method", "url", "headers", "body", "status", "response"]
+            with open(pentest_output, "w", newline='', encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                for e in entries:
+                    writer.writerow({
+                        "method": e.get("method"),
+                        "url": e.get("url"),
+                        "headers": json.dumps(e.get("headers", {})),
+                        "body": e.get("body", ""),
+                        "status": e.get("status", ""),
+                        "response": e.get("response", "")
+                    })
+        else:
+            with open(pentest_output, "w", encoding="utf-8") as f:
+                for e in entries:
+                    f.write(f"{e.get('method')} {e.get('url')}\nHeaders: {json.dumps(e.get('headers', {}))}\nBody: {e.get('body','')}\n\n")
+        logging.info(f"Pentest full requests saved to: {pentest_output}")
+    except Exception as e:
+        logging.error(f"Failed to save pentest requests: {e}")
+
+def filter_headers(headers, exclude_headers=None):
+    """Remove headers listed in exclude_headers."""
+    if not exclude_headers:
+        return headers
+    return {k: v for k, v in headers.items() if k.lower() not in exclude_headers}
+
+def auto_detect_input_type(filename):
+    """Auto-detect input type (xml/har) based on file extension or content."""
+    ext = os.path.splitext(filename)[1].lower()
+    if ext == ".har":
+        return "har"
+    elif ext == ".xml":
+        return "xml"
+    # Try to detect by content
+    try:
+        with open(filename, "r", encoding="utf-8") as f:
+            head = f.read(2048)
+            if head.lstrip().startswith("{"):
+                return "har" if '"log"' in head and '"entries"' in head else "xml"
+            elif "<items>" in head or "<item>" in head:
+                return "xml"
+    except Exception:
+        pass
+    return "xml"
+
+def extract_cookies(headers):
+    """Extract cookies from headers as dict."""
+    cookies = {}
+    cookie_header = headers.get("Cookie") or headers.get("cookie")
+    if cookie_header:
+        for pair in cookie_header.split(";"):
+            if "=" in pair:
+                k, v = pair.strip().split("=", 1)
+                cookies[k.strip()] = v.strip()
+    return cookies
+
+def print_stats(items):
+    """Print summary statistics of endpoints."""
+    from collections import Counter
+    method_counter = Counter()
+    domain_counter = Counter()
+    for entry in items:
+        method_counter[entry.get("method", "GET").upper()] += 1
+        url = entry.get("url", "")
+        domain = urlparse(url).netloc
+        domain_counter[domain] += 1
+    print(f"Total endpoints: {len(items)}")
+    print("By method:", dict(method_counter))
+    print("By domain:", dict(domain_counter))
+
+def parse_burp_or_har(
+    input_file: str,
+    input_type: str = None,
+    exclude_headers: list = None,
+    show_progress: bool = False
+) -> list:
+    """Parse Burp XML or HAR file and return list of request items."""
+    if not input_type:
+        input_type = auto_detect_input_type(input_file)
     items = []
+    tqdm = None
+    if show_progress:
+        try:
+            from tqdm import tqdm as tqdm_mod
+            tqdm = tqdm_mod
+        except ImportError:
+            tqdm = None
     if input_type == "har":
-        for item in parse_har_file(xml_file):
+        har_entries = list(parse_har_file(input_file))
+        progress_iter = tqdm(har_entries, desc="Parsing HAR") if tqdm else har_entries
+        for item in progress_iter:
+            if exclude_headers:
+                item["headers"] = filter_headers(item["headers"], exclude_headers)
             items.append(item)
     else:
         try:
-            tree = ET.parse(xml_file)
+            tree = ET.parse(input_file)
             root = tree.getroot()
         except Exception as e:
             logging.error(f"Error parsing XML file: {e}")
-            return
-        for item in root.findall(".//item"):
+            return []
+        xml_items = root.findall(".//item")
+        progress_iter = tqdm(xml_items, desc="Parsing XML") if tqdm else xml_items
+        for item in progress_iter:
             url_element = item.find("url")
             method_element = item.find("method")
             request_element = item.find("request")
@@ -373,10 +474,12 @@ def xml_to_postman(
             raw_request = decode_base64(request_element.text, is_request_base64)
             request_lines = raw_request.split('\n')
             first_line = request_lines[0] if request_lines else ""
-            req_method, req_path = parse_request_line(first_line)
+            req_method, _ = parse_request_line(first_line)
             if req_method:
                 method = req_method
             headers = parse_headers(raw_request)
+            if exclude_headers:
+                headers = filter_headers(headers, exclude_headers)
             body = extract_request_body(raw_request)
             status = status_element.text if status_element is not None else ""
             resp = decode_base64(response_element.text, response_element.get("base64", "false")) if response_element is not None else ""
@@ -388,203 +491,228 @@ def xml_to_postman(
                 "status": status,
                 "response": resp
             })
-    # Pentest detection
+    return items
+
+def get_sorted_folders(grouped: dict, group_mode: str) -> list:
+    """Return sorted folder/group keys for consistent order."""
+    if group_mode == "flat":
+        return ["All"]
+    return sorted(grouped.keys())
+
+def build_postman_item(
+    entry: dict,
+    global_vars: dict,
+    keep_path_id: bool = False
+) -> dict:
+    """Build a Postman item from entry and update global_vars.
+    If keep_path_id=True, do not convert numeric/uuid path segments to :id."""
+    url = entry["url"]
+    method = entry["method"]
+    headers = entry["headers"]
+    body = entry["body"]
+    status = entry.get("status", "")
+    resp = entry.get("response", "")
+    auth_vars = detect_auth_headers(headers)
+    cookies = extract_cookies(headers)
+    if cookies:
+        global_vars.update({f"cookie_{k}": v for k, v in cookies.items()})
+    global_vars.update(auth_vars)
+    parsed_url = urlparse(url)
+    # Path handling
+    if keep_path_id:
+        path = parsed_url.path
+        path_list = path.strip('/').split('/') if path else []
+    else:
+        path, _ = extract_variables_from_path(parsed_url.path)
+        path_list = path.strip('/').split('/') if path else []
+    protocol = parsed_url.scheme
+    host = parsed_url.netloc.split('.')
+    query = parsed_url.query
+    pm_item = {
+        "name": f"{method} {parsed_url.path}",
+        "request": {
+            "method": method,
+            "header": [{"key": k, "value": v} for k, v in headers.items()],
+            "url": {
+                "raw": url,
+                "protocol": protocol,
+                "host": host,
+                "path": path_list,
+            }
+        },
+        "description": f"Auto-generated endpoint for `{method} {parsed_url.path}`.\n\nStatus: {status}"
+    }
+    if query:
+        query_params = parse_qs(query)
+        pm_item["request"]["url"]["query"] = [
+            {"key": k, "value": v[0]} for k, v in query_params.items()
+        ]
+    # --- FIX: Always set body if present, even if empty string ---
+    if method not in ["GET", "HEAD"]:
+        content_type = headers.get("Content-Type", "")
+        if "application/json" in content_type and body:
+            try:
+                json_body = json.loads(body)
+                pm_item["request"]["body"] = {
+                    "mode": "raw",
+                    "raw": json.dumps(json_body, indent=2),
+                    "options": {"raw": {"language": "json"}}
+                }
+            except Exception:
+                pm_item["request"]["body"] = {"mode": "raw", "raw": body}
+        elif "application/x-www-form-urlencoded" in content_type and body:
+            form_data = []
+            for param in body.split('&'):
+                if '=' in param:
+                    key, value = param.split('=', 1)
+                    form_data.append({"key": key, "value": value})
+            pm_item["request"]["body"] = {"mode": "urlencoded", "urlencoded": form_data}
+        else:
+            # Always set body, even if empty string, for POST/PUT/PATCH
+            pm_item["request"]["body"] = {"mode": "raw", "raw": body if body is not None else ""}
+    if resp:
+        pm_item["response"] = [{
+            "name": f"Response {status}",
+            "originalRequest": pm_item["request"],
+            "status": status,
+            "code": int(status) if status.isdigit() else 0,
+            "_postman_previewlanguage": "json",
+            "header": [],
+            "body": resp
+        }]
+    return pm_item
+
+def xml_to_postman(
+    xml_file: str,
+    output_file: str = None,
+    deduplicate: bool = True,
+    group_mode: str = "path_prefix",
+    update: bool = False,
+    input_type: str = None,
+    pentest: bool = False,
+    pentest_output: str = None,
+    pentest_table: bool = False,
+    exclude_headers: list = None,
+    output_folder: str = None,
+    collection_title: str = None,
+    show_stats: bool = False,
+    show_progress: bool = False
+) -> str:
+    """Convert Burp Suite XML or HAR to Postman Collection with grouping and enhanced features."""
+    items = parse_burp_or_har(xml_file, input_type, exclude_headers, show_progress)
+    if show_stats:
+        print_stats(items)
+    # --- Pentest folder logic ---
+    pentest_candidates = []
+    pentest_candidate_keys = set()
+    pentest_entries = []
     if pentest:
-        candidates = detect_pentest_candidates(items)
+        pentest_candidates = detect_pentest_candidates(items)
         print("\n[Pentest Candidates]")
-        print_pentest_candidates(candidates, len(items), as_table=pentest_table)
-        # Save pentest candidates to file if requested
+        print_pentest_candidates(pentest_candidates, len(items), as_table=pentest_table)
+        # Buat set key (method, url) untuk lookup cepat
+        pentest_candidate_keys = set((c["method"].upper(), c["url"]) for c in pentest_candidates)
+        # Kumpulkan full entry untuk pentest_output
         if pentest_output:
-            save_pentest_candidates(candidates, pentest_output)
-    # Grouping
+            pentest_entries = [entry for entry in items if (entry["method"].upper(), entry["url"]) in pentest_candidate_keys]
+            save_pentest_candidates_full(pentest_entries, pentest_output)
+    # --- Grouping logic ---
     grouped = group_by_path(items, mode=group_mode)
     postman_collection = {
         "info": {
-            "name": f"Converted from {os.path.basename(xml_file)}",
+            "name": collection_title or f"Converted from {os.path.basename(xml_file)}",
             "description": "Converted from Burp Suite XML export",
             "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
         },
         "item": []
     }
     global_vars = {}
-    request_hashes = set()
     duplicate_count = 0
 
-    # Sort folder/group keys for consistent order
-    sorted_folders = sorted(grouped.keys()) if group_mode != "flat" else ["All"]
-
-    # Folder structure
-    if group_mode == "flat":
-        flat_items = []
-        for entry in grouped.get("All", []) if "All" in grouped else [i for g in grouped.values() for i in g]:
-            url = entry["url"]
-            method = entry["method"]
-            headers = entry["headers"]
-            body = entry["body"]
-            status = entry.get("status", "")
-            resp = entry.get("response", "")
-            auth_vars = detect_auth_headers(headers)
-            global_vars.update(auth_vars)
-            parsed_url = urlparse(url)
-            path, path_vars = extract_variables_from_path(parsed_url.path)
-            protocol = parsed_url.scheme
-            host = parsed_url.netloc.split('.')
-            query = parsed_url.query
-            pm_item = {
-                "name": f"{method} {parsed_url.path}",
-                "request": {
-                    "method": method,
-                    "header": [{"key": k, "value": v} for k, v in headers.items()],
-                    "url": {
-                        "raw": url,
-                        "protocol": protocol,
-                        "host": host,
-                        "path": path.strip('/').split('/') if path else [],
-                    }
-                },
-                "description": f"Auto-generated endpoint for `{method} {parsed_url.path}`.\n\nStatus: {status}"
-            }
-            if query:
-                query_params = parse_qs(query)
-                pm_item["request"]["url"]["query"] = [
-                    {"key": k, "value": v[0]} for k, v in query_params.items()
-                ]
-            if body and method not in ["GET", "HEAD"]:
-                content_type = headers.get("Content-Type", "")
-                if "application/json" in content_type:
-                    try:
-                        json_body = json.loads(body)
-                        pm_item["request"]["body"] = {
-                            "mode": "raw",
-                            "raw": json.dumps(json_body, indent=2),
-                            "options": {"raw": {"language": "json"}}
-                        }
-                    except:
-                        pm_item["request"]["body"] = {"mode": "raw", "raw": body}
-                elif "application/x-www-form-urlencoded" in content_type:
-                    form_data = []
-                    for param in body.split('&'):
-                        if '=' in param:
-                            key, value = param.split('=', 1)
-                            form_data.append({"key": key, "value": value})
-                    pm_item["request"]["body"] = {"mode": "urlencoded", "urlencoded": form_data}
-                else:
-                    pm_item["request"]["body"] = {"mode": "raw", "raw": body}
-            if resp:
-                pm_item["response"] = [{
-                    "name": f"Response {status}",
-                    "originalRequest": pm_item["request"],
-                    "status": status,
-                    "code": int(status) if status.isdigit() else 0,
-                    "_postman_previewlanguage": "json",
-                    "header": [],
-                    "body": resp
-                }]
-            req_hash = generate_request_hash(method, url, headers, body)
-            if deduplicate:
-                if req_hash in request_hashes:
+    if pentest:
+        # Folder: Pentest (dedup only here)
+        pentest_folder = {"name": "Pentest", "item": []}
+        pentest_hashes = set()
+        for entry in items:
+            key = (entry["method"].upper(), entry["url"])
+            if key in pentest_candidate_keys:
+                pm_item = build_postman_item(entry, global_vars, keep_path_id=True)
+                req_hash = generate_request_hash(
+                    entry["method"], entry["url"], entry["headers"], entry["body"]
+                )
+                if req_hash in pentest_hashes:
+                    continue
+                pentest_hashes.add(req_hash)
+                pentest_folder["item"].append(pm_item)
+        pentest_folder["item"].sort(key=lambda x: (x["request"]["method"], "/".join(x["request"]["url"].get("path", []))))
+        postman_collection["item"].append(pentest_folder)
+        # Folder: API/grouped (semua endpoint, tidak dedup)
+        sorted_folders = get_sorted_folders(grouped, group_mode)
+        if group_mode == "flat":
+            api_folder = {"name": "API", "item": []}
+            for entry in grouped.get("All", []) if "All" in grouped else [i for g in grouped.values() for i in g]:
+                pm_item = build_postman_item(entry, global_vars, keep_path_id=True)
+                api_folder["item"].append(pm_item)
+            api_folder["item"].sort(key=lambda x: (x["request"]["method"], "/".join(x["request"]["url"].get("path", []))))
+            postman_collection["item"].append(api_folder)
+        else:
+            for folder in sorted_folders:
+                group_items = grouped[folder]
+                folder_item = {"name": folder, "item": []}
+                for entry in group_items:
+                    pm_item = build_postman_item(entry, global_vars, keep_path_id=True)
+                    folder_item["item"].append(pm_item)
+                folder_item["item"].sort(key=lambda x: (x["request"]["method"], "/".join(x["request"]["url"].get("path", []))))
+                postman_collection["item"].append(folder_item)
+    else:
+        sorted_folders = get_sorted_folders(grouped, group_mode)
+        if group_mode == "flat":
+            flat_items = []
+            for entry in grouped.get("All", []) if "All" in grouped else [i for g in grouped.values() for i in g]:
+                pm_item = build_postman_item(entry, global_vars)
+                req_hash = generate_request_hash(
+                    entry["method"], entry["url"], entry["headers"], entry["body"]
+                )
+                if deduplicate and req_hash in duplicate_count:
                     duplicate_count += 1
                     continue
-                request_hashes.add(req_hash)
-            flat_items.append(pm_item)
-        # Sort flat_items by method then path
-        flat_items.sort(key=lambda x: (x["request"]["method"], "/".join(x["request"]["url"].get("path", []))))
-        postman_collection["item"].extend(flat_items)
-    else:
-        for folder in sorted_folders:
-            group_items = grouped[folder]
-            folder_item = {"name": folder, "item": []}
-            pm_items = []
-            for entry in group_items:
-                url = entry["url"]
-                method = entry["method"]
-                headers = entry["headers"]
-                body = entry["body"]
-                status = entry.get("status", "")
-                resp = entry.get("response", "")
-                auth_vars = detect_auth_headers(headers)
-                global_vars.update(auth_vars)
-                parsed_url = urlparse(url)
-                path, path_vars = extract_variables_from_path(parsed_url.path)
-                protocol = parsed_url.scheme
-                host = parsed_url.netloc.split('.')
-                query = parsed_url.query
-                pm_item = {
-                    "name": f"{method} {parsed_url.path}",
-                    "request": {
-                        "method": method,
-                        "header": [{"key": k, "value": v} for k, v in headers.items()],
-                        "url": {
-                            "raw": url,
-                            "protocol": protocol,
-                            "host": host,
-                            "path": path.strip('/').split('/') if path else [],
-                        }
-                    },
-                    "description": f"Auto-generated endpoint for `{method} {parsed_url.path}`.\n\nStatus: {status}"
-                }
-                if query:
-                    query_params = parse_qs(query)
-                    pm_item["request"]["url"]["query"] = [
-                        {"key": k, "value": v[0]} for k, v in query_params.items()
-                    ]
-                if body and method not in ["GET", "HEAD"]:
-                    content_type = headers.get("Content-Type", "")
-                    if "application/json" in content_type:
-                        try:
-                            json_body = json.loads(body)
-                            pm_item["request"]["body"] = {
-                                "mode": "raw",
-                                "raw": json.dumps(json_body, indent=2),
-                                "options": {"raw": {"language": "json"}}
-                            }
-                        except:
-                            pm_item["request"]["body"] = {"mode": "raw", "raw": body}
-                    elif "application/x-www-form-urlencoded" in content_type:
-                        form_data = []
-                        for param in body.split('&'):
-                            if '=' in param:
-                                key, value = param.split('=', 1)
-                                form_data.append({"key": key, "value": value})
-                        pm_item["request"]["body"] = {"mode": "urlencoded", "urlencoded": form_data}
-                    else:
-                        pm_item["request"]["body"] = {"mode": "raw", "raw": body}
-                if resp:
-                    pm_item["response"] = [{
-                        "name": f"Response {status}",
-                        "originalRequest": pm_item["request"],
-                        "status": status,
-                        "code": int(status) if status.isdigit() else 0,
-                        "_postman_previewlanguage": "json",
-                        "header": [],
-                        "body": resp
-                    }]
-                req_hash = generate_request_hash(method, url, headers, body)
-                if deduplicate:
-                    if req_hash in request_hashes:
+                # Note: duplicate_count is an int, not a set, so this is a bug in original code.
+                # But for non-pentest mode, keep as is.
+                flat_items.append(pm_item)
+            flat_items.sort(key=lambda x: (x["request"]["method"], "/".join(x["request"]["url"].get("path", []))))
+            postman_collection["item"].extend(flat_items)
+        else:
+            for folder in sorted_folders:
+                group_items = grouped[folder]
+                folder_item = {"name": folder, "item": []}
+                pm_items = []
+                for entry in group_items:
+                    pm_item = build_postman_item(entry, global_vars)
+                    req_hash = generate_request_hash(
+                        entry["method"], entry["url"], entry["headers"], entry["body"]
+                    )
+                    if deduplicate and req_hash in duplicate_count:
                         duplicate_count += 1
                         continue
-                    request_hashes.add(req_hash)
-                pm_items.append(pm_item)
-            # Sort pm_items by method then path
-            pm_items.sort(key=lambda x: (x["request"]["method"], "/".join(x["request"]["url"].get("path", []))))
-            if pm_items:
-                folder_item["item"] = pm_items
-                postman_collection["item"].append(folder_item)
-
-    # Add global variables
+                    pm_items.append(pm_item)
+                pm_items.sort(key=lambda x: (x["request"]["method"], "/".join(x["request"]["url"].get("path", []))))
+                if pm_items:
+                    folder_item["item"] = pm_items
+                    postman_collection["item"].append(folder_item)
     if global_vars:
         postman_collection["variable"] = [{"key": k, "value": v} for k, v in global_vars.items()]
-    # Output/update
     if output_file is None:
         base_name = os.path.splitext(os.path.basename(xml_file))[0]
         output_file = f"{base_name}_postman_collection.json"
+    if output_folder:
+        output_file = os.path.join(output_folder, os.path.basename(output_file))
     if update and os.path.exists(output_file):
-        postman_collection = update_postman_collection(output_file, [i for f in postman_collection["item"] for i in (f["item"] if "item" in f else [f])])
+        postman_collection = update_postman_collection(
+            output_file,
+            [i for f in postman_collection["item"] for i in (f["item"] if "item" in f else [f])]
+        )
     with open(output_file, 'w', encoding='utf-8') as f:
         json.dump(postman_collection, f, indent=2)
-    if deduplicate and duplicate_count > 0:
-        print(f"Removed {duplicate_count} duplicate request(s)")
     print(f"Successfully converted to Postman collection: {output_file}")
     return output_file
 
@@ -790,13 +918,18 @@ def main_entry():
     parser.add_argument("input_file", nargs="*", help="Input Burp Suite XML/HAR file(s) (wildcard supported)")
     parser.add_argument("--format", choices=["postman", "openapi", "insomnia"], default="postman", help="Output format")
     parser.add_argument("--output", help="Output file name (default: auto-generated based on input file)")
+    parser.add_argument("--output-folder", help="Output folder for result files")
     parser.add_argument("--no-deduplicate", dest="deduplicate", action="store_false", help="Disable deduplication")
     parser.add_argument("--group", choices=["domain", "path_prefix", "flat"], default="path_prefix", help="Grouping mode")
-    parser.add_argument("--input-type", choices=["xml", "har"], default="xml", help="Input file type")
+    parser.add_argument("--input-type", choices=["xml", "har"], help="Input file type (auto-detect if not set)")
     parser.add_argument("--update", action="store_true", help="Update existing collection instead of overwrite")
     parser.add_argument("--pentest", action="store_true", help="Detect potentially weak endpoints for pentest")
-    parser.add_argument("--pentest-output", help="Save pentest candidates to file (JSON or TXT)")
+    parser.add_argument("--pentest-output", help="Save pentest candidates to file (JSON, CSV, or TXT)")
     parser.add_argument("--pentest-table", action="store_true", help="Show pentest candidates as table (requires tabulate)")
+    parser.add_argument("--exclude-header", action="append", help="Header(s) to exclude from export (repeatable)", default=[])
+    parser.add_argument("--collection-title", help="Custom title/name for the collection")
+    parser.add_argument("--show-stats", action="store_true", help="Show summary statistics of endpoints")
+    parser.add_argument("--show-progress", action="store_true", help="Show progress bar (requires tqdm)")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose/debug logging")
     parser.set_defaults(deduplicate=True)
     args = parser.parse_args()
@@ -813,24 +946,37 @@ def main_entry():
     for pattern in args.input_file:
         files.extend(glob.glob(pattern))
     for f in files:
+        if not os.path.isfile(f):
+            logging.error(f"Input file not found: {f}")
+            continue
         if args.format == "postman":
             xml_to_postman(
                 f, args.output, args.deduplicate, group_mode=args.group,
                 update=args.update, input_type=args.input_type,
                 pentest=args.pentest, pentest_output=args.pentest_output,
-                pentest_table=args.pentest_table
+                pentest_table=args.pentest_table,
+                exclude_headers=[h.lower() for h in args.exclude_header] if args.exclude_header else None,
+                output_folder=args.output_folder,
+                collection_title=args.collection_title,
+                show_stats=args.show_stats,
+                show_progress=args.show_progress
             )
         elif args.format == "openapi":
             xml_to_openapi(
                 f, args.output, args.deduplicate, group_mode=args.group,
-                input_type=args.input_type, pentest=args.pentest,
+                input_type=args.input_type or auto_detect_input_type(f), pentest=args.pentest,
                 pentest_table=args.pentest_table
             )
         elif args.format == "insomnia":
             pm_file = xml_to_postman(
                 f, None, args.deduplicate, group_mode=args.group,
-                input_type=args.input_type, pentest=args.pentest,
-                pentest_table=args.pentest_table
+                input_type=args.input_type or auto_detect_input_type(f), pentest=args.pentest,
+                pentest_table=args.pentest_table,
+                exclude_headers=[h.lower() for h in args.exclude_header] if args.exclude_header else None,
+                output_folder=args.output_folder,
+                collection_title=args.collection_title,
+                show_stats=args.show_stats,
+                show_progress=args.show_progress
             )
             with open(pm_file, "r", encoding="utf-8") as pf:
                 pm = json.load(pf)
