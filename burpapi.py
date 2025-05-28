@@ -759,10 +759,35 @@ def xml_to_openapi(
     print(f"Successfully converted to OpenAPI specification: {output_file}")
     return output_file
 
+def initialize_environment():
+    """Check for required libraries and validate the environment."""
+    missing_libraries = []
+    try:
+        import tabulate  # Check if tabulate is installed
+    except ImportError:
+        missing_libraries.append("tabulate")
+
+    if missing_libraries:
+        print("Warning: The following libraries are missing:")
+        for lib in missing_libraries:
+            print(f"  - {lib}")
+        print("You can install them using:")
+        print(f"  pip install {' '.join(missing_libraries)}")
+    
+    # Check Python version
+    import sys
+    if sys.version_info < (3, 6):
+        print("Error: Python 3.6 or higher is required to run this script.")
+        sys.exit(1)
+
+    # Check if required directories or files exist (if applicable)
+    print("Environment initialized successfully.")
+
 def main_entry():
     """Entry point for CLI and import."""
     parser = argparse.ArgumentParser(description="Convert Burp Suite XML/HAR to Postman, OpenAPI, or Insomnia")
-    parser.add_argument("input_file", nargs="+", help="Input Burp Suite XML/HAR file(s) (wildcard supported)")
+    parser.add_argument("--check-env", action="store_true", help="Check environment for required libraries and Python version")
+    parser.add_argument("input_file", nargs="*", help="Input Burp Suite XML/HAR file(s) (wildcard supported)")
     parser.add_argument("--format", choices=["postman", "openapi", "insomnia"], default="postman", help="Output format")
     parser.add_argument("--output", help="Output file name (default: auto-generated based on input file)")
     parser.add_argument("--no-deduplicate", dest="deduplicate", action="store_false", help="Disable deduplication")
@@ -775,6 +800,14 @@ def main_entry():
     parser.add_argument("--verbose", action="store_true", help="Enable verbose/debug logging")
     parser.set_defaults(deduplicate=True)
     args = parser.parse_args()
+
+    if args.check_env:
+        initialize_environment()
+        return  # Exit after environment check if the flag is used
+
+    if not args.input_file:
+        parser.error("the following arguments are required: input_file")
+
     setup_logging(args.verbose)
     files = []
     for pattern in args.input_file:
