@@ -1,115 +1,229 @@
 # BurpToAPI
-
-BurpToAPI is a Python tool for converting Burp Suite XML or HAR files into Postman collections, OpenAPI specifications, or Insomnia exports. It also includes features for detecting potentially weak endpoints for pentesting.
+BurpToAPI is a comprehensive Python tool for converting Burp Suite XML or HAR files into Postman collections, OpenAPI specifications, or Insomnia exports. It includes advanced features for security testing and API documentation generation.
 
 ## Features
 
-- Convert Burp Suite XML or HAR files to:
-  - Postman collections
-  - OpenAPI specifications
+- **Multi-format Conversion**: Convert Burp Suite XML or HAR files to:
+  - Postman collections (v2.1)
+  - OpenAPI specifications (3.0.0)
   - Insomnia exports
-- Group endpoints by domain, path prefix, or flat structure.
-- Detect potentially weak or interesting endpoints for pentesting.
-- Deduplicate requests to avoid duplicates in the output.
-- Automatically extract and replace sensitive headers or tokens with variables.
+- **Smart Grouping**: Organize endpoints by domain, path prefix, or flat structure
+- **Pentest Detection**: Automatically detect potentially weak or interesting endpoints for security testing
+- **Deduplication**: Remove duplicate requests based on method, URL, headers, and body
+- **Security Features**:
+  - Sensitive data redaction in logs
+  - Path traversal protection
+  - XXE attack prevention in XML parsing
+  - Automatic extraction of authentication tokens as variables
+- **Performance Optimizations**:
+  - Streaming XML parser for large files (>50MB)
+  - Parallel processing for multiple files
+  - Cached hashing for faster deduplication
+- **Flexible Output**: Support for JSON, CSV, and TXT formats for pentest results
 
 ## Requirements
 
 - Python 3.6 or higher
-- Optional: `tabulate` library for displaying pentest candidates in table format.
+- Recommended optional libraries:
+  - `tabulate` - for table formatting of pentest candidates
+  - `tqdm` - for progress bars
+  - `defusedxml` - for secure XML parsing
 
-Install `tabulate` using:
+Install optional dependencies:
+```bash
+pip install tabulate tqdm defusedxml
+```
+
+## Installation
 
 ```bash
-pip install tabulate
+git clone <repository-url>
+cd burptoapi
 ```
 
 ## Usage
 
-Run the script using the command line:
+### Basic Command Structure
 
 ```bash
 python burpapi.py [input_file(s)] [options]
 ```
 
-### Options
+### Main Options
 
-| Option                  | Description                                                                 |
-|-------------------------|-----------------------------------------------------------------------------|
-| `--format`              | Output format: `postman`, `openapi`, or `insomnia`. Default: `postman`.    |
-| `--output`              | Output file name. Default: auto-generated based on the input file.         |
-| `--no-deduplicate`      | Disable deduplication of requests.                                         |
-| `--group`               | Grouping mode: `domain`, `path_prefix`, or `flat`. Default: `path_prefix`. |
-| `--input-type`          | Input file type: `xml` or `har`. Default: `xml`.                          |
-| `--update`              | Update an existing Postman collection instead of overwriting it.          |
-| `--pentest`             | Detect potentially weak endpoints for pentesting.                         |
-| `--pentest-output`      | Save pentest candidates to a file (JSON or TXT).                          |
-| `--pentest-table`       | Display pentest candidates as a table (requires `tabulate`).              |
-| `--verbose`             | Enable verbose/debug logging.                                             |
+| Option | Description |
+|--------|-------------|
+| `input_file` | Input Burp Suite XML/HAR file(s) (supports wildcards) |
+| `--format` | Output format: `postman`, `openapi`, or `insomnia` (default: postman) |
+| `--output` | Output file name (auto-generated if not specified) |
+| `--output-folder` | Output folder for result files |
+| `--input-type` | Input file type: `xml` or `har` (auto-detected if not set) |
+| `--collection-title` | Custom title/name for the collection |
 
-### Examples
+### Processing Options
 
-1. **Convert a single Burp XML file to Postman collection**:
+| Option | Description |
+|--------|-------------|
+| `--no-deduplicate` | Disable request deduplication |
+| `--group` | Grouping mode: `domain`, `path_prefix`, or `flat` (default: path_prefix) |
+| `--update` | Update existing Postman collection instead of overwriting |
+| `--exclude-header` | Header(s) to exclude from export (repeatable) |
+| `--show-stats` | Show summary statistics of endpoints |
+| `--show-progress` | Show progress bar (requires tqdm) |
+
+### Security Testing Options
+
+| Option | Description |
+|--------|-------------|
+| `--pentest` | Detect potentially weak endpoints for pentesting |
+| `--pentest-output` | Save pentest candidates to file (JSON, CSV, or TXT) |
+| `--pentest-table` | Show pentest candidates as table (requires tabulate) |
+
+### Utility Options
+
+| Option | Description |
+|--------|-------------|
+| `--check-env` | Check environment for required libraries and Python version |
+| `--verbose` | Enable verbose/debug logging with sensitive data redaction |
+
+## Examples
+
+### Basic Conversions
+
+1. **Convert Burp XML to Postman collection**:
    ```bash
-   python burpapi.py hasil.xml --format postman
+   python burpapi.py scan_results.xml --format postman
    ```
 
-2. **Convert multiple files to OpenAPI, grouped by domain**:
+2. **Convert HAR to OpenAPI specification**:
    ```bash
-   python burpapi.py hasil*.xml --format openapi --group domain
+   python burpapi.py traffic.har --format openapi --input-type har
    ```
 
-3. **Import a HAR file and export to Insomnia**:
+3. **Export to Insomnia**:
    ```bash
-   python burpapi.py traffic.har --input-type har --format insomnia
+   python burpapi.py scan_results.xml --format insomnia
    ```
 
-4. **Update an existing Postman collection**:
+### Advanced Usage
+
+4. **Group endpoints by domain with custom title**:
    ```bash
-   python burpapi.py hasil.xml --format postman --update --output koleksi.json
+   python burpapi.py scan.xml --format postman --group domain --collection-title "My API"
    ```
 
-5. **Group all endpoints into a single folder**:
+5. **Update existing Postman collection**:
    ```bash
-   python burpapi.py hasil.xml --group flat
+   python burpapi.py new_scan.xml --format postman --update --output existing_collection.json
    ```
 
-6. **Detect pentest candidates and save to a file**:
+6. **Process multiple files with progress bar**:
    ```bash
-   python burpapi.py hasil.xml --pentest --pentest-output candidates.json
+   python burpapi.py scan*.xml --format postman --show-progress --output-folder ./exports
    ```
 
-7. **Show pentest candidates as a table**:
+### Security Testing
+
+7. **Detect pentest candidates and display as table**:
    ```bash
-   python burpapi.py hasil.xml --pentest --pentest-table
+   python burpapi.py scan.xml --pentest --pentest-table
    ```
 
-### Help
+8. **Save pentest candidates to JSON file**:
+   ```bash
+   python burpapi.py scan.xml --pentest --pentest-output candidates.json
+   ```
 
-For a full list of options, run:
+9. **Exclude specific headers from export**:
+   ```bash
+   python burpapi.py scan.xml --format postman --exclude-header Cookie --exclude-header User-Agent
+   ```
 
-```bash
-python burpapi.py --help
-```
+10. **Show detailed statistics**:
+    ```bash
+    python burpapi.py scan.xml --format postman --show-stats
+    ```
 
-## Output Formats
+### Environment Check
+
+11. **Verify environment setup**:
+    ```bash
+    python burpapi.py --check-env
+    ```
+
+## Output Details
 
 ### Postman Collection
-
-The tool generates a Postman collection in JSON format, compatible with Postman v2.1 schema.
+- Compatible with Postman v2.1 schema
+- Organized folders based on grouping mode
+- Authentication tokens extracted as variables
+- Request/response examples preserved
+- Smart body handling for JSON and form data
 
 ### OpenAPI Specification
-
-The tool generates an OpenAPI 3.0 specification with detailed paths, parameters, and responses.
+- OpenAPI 3.0.0 compliant
+- Path parameters automatically detected
+- Query parameters documented
+- Request/response schemas and examples
+- Tag-based organization
 
 ### Insomnia Export
+- Compatible with Insomnia REST client
+- Preserves all request details
+- Maintains authentication information
 
-The tool generates an Insomnia export file, compatible with Insomnia REST client.
+### Pentest Detection
+The tool identifies potentially weak endpoints based on:
+- Sensitive parameters in path, query, or body
+- Authentication headers (Basic, Bearer, API keys)
+- Numeric/UUID path segments
+- JSON bodies with sensitive field names
+- HTTP methods with request bodies
 
-## License
+## Security Features
 
-This project is licensed under the MIT License. See the `LICENSE` file for details.
+- **Safe XML Parsing**: Uses defusedxml when available, with XXE protection fallbacks
+- **Path Traversal Prevention**: Enhanced safe path joining with suspicious filename detection
+- **Sensitive Data Redaction**: Multi-layer logging filter to prevent secret leakage
+- **Base64 Validation**: Safe base64 decoding with proper error handling
+- **Atomic Writes**: Prevents partial file writes during export
 
-## Contributing
+## Performance
 
-Contributions are welcome! Feel free to submit issues or pull requests to improve the tool.
+- **Streaming Parser**: Handles large XML files (>50MB) efficiently
+- **Parallel Processing**: Processes multiple files concurrently
+- **Cached Hashing**: Speeds up duplicate detection
+- **Memory Efficient**: Clears XML elements during streaming parse
+
+## Troubleshooting
+
+### Common Issues
+
+1. **Missing Dependencies**:
+   ```bash
+   pip install tabulate tqdm defusedxml
+   ```
+
+2. **Large File Processing**:
+   - Use `--show-progress` to monitor parsing
+   - The script automatically uses streaming for files >50MB
+
+3. **Permission Errors**:
+   - Ensure write permissions for output directory
+   - Use `--output-folder` to specify writable location
+
+4. **Encoding Issues**:
+   - Script handles UTF-8, Latin-1, and CP1252 encodings
+   - Uses replacement strategies for malformed data
+
+Key updates made to match `burpapi.py`:
+1. Added all new command-line options (`--check-env`, `--output-folder`, `--exclude-header`, `--collection-title`, `--show-stats`, `--show-progress`)
+2. Documented security features (XXE protection, path traversal prevention, sensitive data redaction)
+3. Added performance optimizations section
+4. Included examples for all major features
+5. Updated requirements with optional dependencies
+6. Added troubleshooting section
+7. Enhanced feature descriptions to match current implementation
+8. Included atomic writes and streaming parser details
+9. Added environment check utility
+10. Enhanced pentest detection documentation
