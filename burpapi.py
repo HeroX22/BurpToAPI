@@ -1185,34 +1185,6 @@ def main():
 if __name__ == "__main__":
     main()
 
-# -------------------------------
-# Contoh Penggunaan:
-#
-# 1. Konversi satu file XML Burp ke Postman, otomatis folder per prefix path:
-#    python burpapi.py hasil.xml --format postman
-#
-# 2. Konversi beberapa file sekaligus (wildcard), hasilkan OpenAPI, group per domain:
-#    python burpapi.py hasil*.xml --format openapi --group domain
-#
-# 3. Import file HAR dan ekspor ke Insomnia:
-#    python burpapi.py traffic.har --input-type har --format insomnia
-#
-# 4. Update koleksi Postman yang sudah ada:
-#    python burpapi.py hasil.xml --format postman --update --output koleksi.json
-#
-# 5. Group flat (semua endpoint dalam satu folder):
-#    python burpapi.py hasil.xml --group flat
-#
-# 6. Konversi dengan variabel header/token otomatis:
-#    python burpapi.py hasil.xml --format postman
-#
-# 7. Deteksi pentest dan simpan ke file:
-#    python burpapi.py hasil.xml --pentest --pentest-output candidates.json
-#
-# Lihat --help untuk opsi lengkap:
-#    python burpapi.py --help
-# -------------------------------
-
 def atomic_write(filename, data):
     """Write data to a file atomically to avoid partial writes."""
     import tempfile
@@ -1334,36 +1306,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-# -------------------------------
-# Contoh Penggunaan:
-#
-# 1. Konversi satu file XML Burp ke Postman, otomatis folder per prefix path:
-#    python burpapi.py hasil.xml --format postman
-#
-# 2. Konversi beberapa file sekaligus (wildcard), hasilkan OpenAPI, group per domain:
-#    python burpapi.py hasil*.xml --format openapi --group domain
-#
-# 3. Import file HAR dan ekspor ke Insomnia:
-#    python burpapi.py traffic.har --input-type har --format insomnia
-#
-# 4. Update koleksi Postman yang sudah ada:
-#    python burpapi.py hasil.xml --format postman --update --output koleksi.json
-#
-# 5. Group flat (semua endpoint dalam satu folder):
-#    python burpapi.py hasil.xml --group flat
-#
-# 6. Konversi dengan variabel header/token otomatis:
-#    python burpapi.py hasil.xml --format postman
-#
-# 7. Deteksi pentest dan simpan ke file:
-#    python burpapi.py hasil.xml --pentest --pentest-output candidates.json
-#
-# Lihat --help untuk opsi lengkap:
-#    python burpapi.py --help
-# -------------------------------
-#    python burpapi.py hasil.xml --pentest --pentest-output candidates.json
-#
-# Lihat --help untuk opsi lengkap:
-#    python burpapi.py --help
-# -------------------------------
