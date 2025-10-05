@@ -134,11 +134,21 @@ def parse_request_line(first_line):
         return method, path
     return None, None
 
-def extract_request_body(raw_request):
-    """Extract request body from raw HTTP request"""
-    parts = raw_request.split('\n\n', 1)
+def extract_request_body(raw_request, preserve_whitespace: bool = False):
+    """Extract request body from raw HTTP request.
+
+    This handles both CRLF (\r\n) and LF (\n) line endings by splitting
+    on the first blank line (headers/body separator). Using a regex makes
+    the split tolerant to different newline styles encountered in Burp
+    exports so the body isn't accidentally dropped.
+
+    preserve_whitespace: when True, do not strip leading/trailing whitespace
+    (helps preserve multipart boundaries and exact payloads).
+    """
+    # Split on the first blank line (handle CRLF or LF)
+    parts = re.split(r"\r?\n\r?\n", raw_request, maxsplit=1)
     if len(parts) > 1:
-        return parts[1].strip()
+        return parts[1] if preserve_whitespace else parts[1].strip()
     return ""
 
 def generate_request_hash(method, url, headers, body=None):
@@ -253,6 +263,7 @@ def parse_har_file(har_file):
         status = str(resp.get("status", ""))
         resp_body = resp.get("content", {}).get("text", "")
         resp_headers = {h["name"]: h["value"] for h in resp.get("headers", [])}
+        # store _raw_request as None for HAR (no raw HTTP message available)
         yield {
             "url": url,
             "method": method,
@@ -260,6 +271,7 @@ def parse_har_file(har_file):
             "body": body,
             "status": status,
             "response": resp_body,
+            "_raw_request": None,
             "response_headers": resp_headers
         }
 
@@ -267,20 +279,160 @@ def update_postman_collection(existing_file, new_items):
     """Update existing Postman collection with new items (avoid duplicates)."""
     with open(existing_file, "r", encoding="utf-8") as f:
         collection = json.load(f)
+    # Recursively collect hashes from existing collection (handle folders)
     existing_hashes = set()
-    for item in collection.get("item", []):
-        if "request" in item:
-            req = item["request"]
+
+    def collect_requests(obj):
+        # obj can be a folder (with 'item') or a request
+        if isinstance(obj, dict) and "request" in obj:
+            req = obj["request"]
             url = req["url"]["raw"] if isinstance(req["url"], dict) else req["url"]
-            method = req["method"]
+            method = req.get("method", "")
             headers = {h["key"]: h["value"] for h in req.get("header", [])}
-            body = req.get("body", {}).get("raw", "")
-            h = generate_request_hash(method, url, headers, body)
-            existing_hashes.add(h)
+            # Normalize body for different Postman body modes
+            body_obj = req.get("body", {}) or {}
+            body_text = ""
+            mode = body_obj.get("mode", "")
+            if mode == "raw":
+                body_text = body_obj.get("raw", "")
+            elif mode == "urlencoded":
+                parts = []
+                for p in body_obj.get("urlencoded", []):
+                    k = p.get("key", "")
+                    v = p.get("value", "")
+                    parts.append(f"{k}={v}")
+                body_text = "&".join(parts)
+            elif mode == "formdata":
+                parts = []
+                for p in body_obj.get("formdata", []):
+                    k = p.get("key", "")
+                    v = p.get("value", "")
+                    parts.append(f"{k}={v}")
+                body_text = "&".join(parts)
+            else:
+                # fallback: try raw
+                body_text = body_obj.get("raw", "") if isinstance(body_obj, dict) else str(body_obj)
+            existing_hashes.add(generate_request_hash(method, url, headers, body_text))
+            # store reference so we can replace empty bodies later if needed
+            existing_hash_to_req = globals().setdefault("_existing_hash_to_req", {})
+            existing_hash_to_req[generate_request_hash(method, url, headers, body_text)] = req
+        elif isinstance(obj, dict) and "item" in obj:
+            for child in obj.get("item", []):
+                collect_requests(child)
+
+    for top in collection.get("item", []):
+        collect_requests(top)
+
+    # Build mapping of existing top-level folders by name for insertion
+    folder_map = {}
+    for top in collection.get("item", []):
+        if isinstance(top, dict) and "item" in top and "name" in top:
+            folder_map[top["name"]] = top
+
+    # If there are request objects at the top level (flattened collection),
+    # move them into folders based on their first path segment to keep
+    # the collection organized.
+    original_items = list(collection.get("item", []))
+    non_request_tops = [it for it in original_items if not (isinstance(it, dict) and "request" in it)]
+    # Process top-level request entries and move them into folder_map
+    for it in original_items:
+        if isinstance(it, dict) and "request" in it:
+            # determine target folder and move
+            try:
+                fname = folder_for_request(it["request"])
+            except Exception:
+                fname = "root"
+            if fname in folder_map:
+                folder_map[fname].setdefault("item", []).append(it)
+            else:
+                # create new folder object and register it
+                newf = {"name": fname, "item": [it]}
+                folder_map[fname] = newf
+
+    # Rebuild collection['item'] to contain non-request top entries plus any folders
+    rebuilt = list(non_request_tops)
+    # Ensure all folder_map folders are present in rebuilt (preserve existing order when possible)
+    for name, f in folder_map.items():
+        if f not in rebuilt:
+            rebuilt.append(f)
+    collection["item"] = rebuilt
+
+    # Helper to determine folder name from request url (first path segment)
+    def folder_for_request(req_obj):
+        url = req_obj["url"]["raw"] if isinstance(req_obj["url"], dict) else req_obj["url"]
+        try:
+            parsed = urlparse(url)
+            seg = parsed.path.strip("/")
+            if not seg:
+                return "root"
+            first = seg.split("/")[0]
+            return first
+        except Exception:
+            return "root"
+
+    # Insert new items into matching folders when possible, otherwise append as top-level
     for item in new_items:
-        h = generate_request_hash(item["request"]["method"], item["request"]["url"]["raw"], {h["key"]: h["value"] for h in item["request"].get("header", [])}, item["request"].get("body", {}).get("raw", ""))
-        if h not in existing_hashes:
-            collection["item"].append(item)
+        req = item.get("request", {})
+        url = req.get("url", {}).get("raw") if isinstance(req.get("url", {}), dict) else req.get("url", "")
+        method = req.get("method", "")
+        headers = {h["key"]: h["value"] for h in req.get("header", [])}
+        # Derive body_text similarly to existing collection
+        body_obj = req.get("body", {}) or {}
+        mode = body_obj.get("mode", "")
+        if mode == "raw":
+            body_text = body_obj.get("raw", "")
+        elif mode == "urlencoded":
+            parts = []
+            for p in body_obj.get("urlencoded", []):
+                k = p.get("key", "")
+                v = p.get("value", "")
+                parts.append(f"{k}={v}")
+            body_text = "&".join(parts)
+        elif mode == "formdata":
+            parts = []
+            for p in body_obj.get("formdata", []):
+                k = p.get("key", "")
+                v = p.get("value", "")
+                parts.append(f"{k}={v}")
+            body_text = "&".join(parts)
+        else:
+            body_text = body_obj.get("raw", "") if isinstance(body_obj, dict) else str(body_obj)
+
+        h = generate_request_hash(method, url, headers, body_text)
+
+        # If a matching request exists without a body but the new one has a body,
+        # prefer replacing the existing request content with the new richer request.
+        existing_map = globals().get("_existing_hash_to_req", {})
+        if h in existing_hashes:
+            existing_req = existing_map.get(h)
+            if existing_req is not None:
+                # detect if existing has empty body and new has non-empty
+                def get_body_text(r):
+                    bo = r.get("body", {}) or {}
+                    mm = bo.get("mode", "")
+                    if mm == "raw":
+                        return bo.get("raw", "")
+                    elif mm == "urlencoded":
+                        return "&".join(f"{p.get('key','')}={p.get('value','')}" for p in bo.get("urlencoded", []))
+                    elif mm == "formdata":
+                        return "&".join(f"{p.get('key','')}={p.get('value','')}" for p in bo.get("formdata", []))
+                    return bo.get("raw", "") if isinstance(bo, dict) else str(bo)
+
+                if get_body_text(existing_req) == "" and body_text != "":
+                    # replace existing request contents
+                    existing_req.clear()
+                    existing_req.update(req)
+            # skip adding duplicate
+            continue
+        # choose folder
+        folder_name = folder_for_request(req)
+        if folder_name in folder_map:
+            folder_map[folder_name].setdefault("item", []).append(item)
+        else:
+            # create new folder to keep structure instead of appending as raw request
+            new_folder = {"name": folder_name, "item": [item]}
+            collection.setdefault("item", []).append(new_folder)
+
     return collection
 
 def export_insomnia(items, output_file):
@@ -569,7 +721,8 @@ def parse_burp_xml_streaming(input_file: str):
                     "headers": headers,
                     "body": body,
                     "status": status,
-                    "response": resp
+                    "response": resp,
+                    "_raw_request": raw_request
                 }
             except Exception as e:
                 logging.debug(f"Error processing streaming item: {e}")
@@ -671,7 +824,8 @@ def parse_burp_or_har(
                         "headers": headers,
                         "body": body,
                         "status": status,
-                        "response": resp
+                        "response": resp,
+                        "_raw_request": raw_request
                     })
         except Exception as e:
             logging.error(f"Error parsing XML file: {e}")
@@ -700,7 +854,11 @@ def build_postman_item(
     url = entry.get("url", "")
     method = entry.get("method", "GET")
     headers = entry.get("headers", {}) or {}
+    # prefer explicit body field; fallback to raw_request if present (preserve multipart etc)
     body = entry.get("body", "") if entry.get("body", "") is not None else ""
+    if (not body) and entry.get("_raw_request"):
+        # extract without stripping to preserve payload exactness
+        body = extract_request_body(entry.get("_raw_request"), preserve_whitespace=True) or body
     status = entry.get("status", "")
     resp = entry.get("response", "")
     auth_vars = detect_auth_headers(headers)
@@ -1062,128 +1220,6 @@ def xml_to_openapi(
         raise
     print(f"Successfully converted to OpenAPI specification: {output_file}")
     return output_file
-
-def atomic_write(filename, data):
-    """Write data to a file atomically to avoid partial writes."""
-    import tempfile
-    import shutil
-    dir_name = os.path.dirname(os.path.abspath(filename)) or "."
-    with tempfile.NamedTemporaryFile("w", dir=dir_name, delete=False, encoding="utf-8") as tf:
-        tf.write(data)
-        tempname = tf.name
-    try:
-        shutil.move(tempname, filename)
-    except Exception:
-        os.remove(tempname)
-        raise
-
-
-def initialize_environment():
-    """Check for required libraries and validate the environment."""
-    missing_libraries = []
-    try:
-        import tabulate  # Check if tabulate is installed
-    except ImportError:
-        missing_libraries.append("tabulate")
-
-    if missing_libraries:
-        print("Warning: The following libraries are missing:")
-        for lib in missing_libraries:
-            print(f"  - {lib}")
-        print("You can install them using:")
-        print(f"  pip install {' '.join(missing_libraries)}")
-    
-    # Check Python version
-    import sys
-    if sys.version_info < (3, 6):
-        print("Error: Python 3.6 or higher is required to run this script.")
-        sys.exit(1)
-
-    # Check if required directories or files exist (if applicable)
-    print("Environment initialized successfully.")
-
-def main_entry():
-    """Entry point for CLI and import."""
-    parser = argparse.ArgumentParser(description="Convert Burp Suite XML/HAR to Postman, OpenAPI, or Insomnia")
-    parser.add_argument("--check-env", action="store_true", help="Check environment for required libraries and Python version")
-    parser.add_argument("input_file", nargs="*", help="Input Burp Suite XML/HAR file(s) (wildcard supported)")
-    parser.add_argument("--format", choices=["postman", "openapi", "insomnia"], default="postman", help="Output format")
-    parser.add_argument("--output", help="Output file name (default: auto-generated based on input file)")
-    parser.add_argument("--output-folder", help="Output folder for result files")
-    parser.add_argument("--no-deduplicate", dest="deduplicate", action="store_false", help="Disable deduplication")
-    parser.add_argument("--group", choices=["domain", "path_prefix", "flat"], default="path_prefix", help="Grouping mode")
-    parser.add_argument("--input-type", choices=["xml", "har"], help="Input file type (auto-detect if not set)")
-    parser.add_argument("--update", action="store_true", help="Update existing collection instead of overwrite")
-    parser.add_argument("--pentest", action="store_true", help="Detect potentially weak endpoints for pentest")
-    parser.add_argument("--pentest-output", help="Save pentest candidates to file (JSON, CSV, or TXT)")
-    parser.add_argument("--pentest-table", action="store_true", help="Show pentest candidates as table (requires tabulate)")
-    parser.add_argument("--exclude-header", action="append", help="Header(s) to exclude from export (repeatable)", default=[])
-    parser.add_argument("--collection-title", help="Custom title/name for the collection")
-    parser.add_argument("--show-stats", action="store_true", help="Show summary statistics of endpoints")
-    parser.add_argument("--show-progress", action="store_true", help="Show progress bar (requires tqdm)")
-    parser.add_argument("--verbose", action="store_true", help="Enable verbose/debug logging")
-    parser.set_defaults(deduplicate=True)
-    args = parser.parse_args()
-
-    if args.check_env:
-        initialize_environment()
-        return  # Exit after environment check if the flag is used
-
-    if not args.input_file:
-        parser.error("the following arguments are required: input_file")
-
-    setup_logging(args.verbose)
-    files = []
-    for pattern in args.input_file:
-        files.extend(glob.glob(pattern))
-    for f in files:
-        if not os.path.isfile(f):
-            logging.error(f"Input file not found: {f}")
-            continue
-        if args.format == "postman":
-            xml_to_postman(
-                f, args.output, args.deduplicate, group_mode=args.group,
-                update=args.update, input_type=args.input_type,
-                pentest=args.pentest, pentest_output=args.pentest_output,
-                pentest_table=args.pentest_table,
-                exclude_headers=[h.lower() for h in args.exclude_header] if args.exclude_header else None,
-                output_folder=args.output_folder,
-                collection_title=args.collection_title,
-                show_stats=args.show_stats,
-                show_progress=args.show_progress
-            )
-        elif args.format == "openapi":
-            xml_to_openapi(
-                f, args.output, args.deduplicate, group_mode=args.group,
-                input_type=args.input_type or auto_detect_input_type(f), pentest=args.pentest,
-                pentest_table=args.pentest_table
-            )
-        elif args.format == "insomnia":
-            pm_file = xml_to_postman(
-                f, None, args.deduplicate, group_mode=args.group,
-                input_type=args.input_type or auto_detect_input_type(f), pentest=args.pentest,
-                pentest_table=args.pentest_table,
-                exclude_headers=[h.lower() for h in args.exclude_header] if args.exclude_header else None,
-                output_folder=args.output_folder,
-                collection_title=args.collection_title,
-                show_stats=args.show_stats,
-                show_progress=args.show_progress
-            )
-            with open(pm_file, "r", encoding="utf-8") as pf:
-                pm = json.load(pf)
-            items = []
-            for folder in pm.get("item", []):
-                if "item" in folder:
-                    items.extend(folder["item"])
-                else:
-                    items.append(folder)
-            export_insomnia(items, args.output or f"{os.path.splitext(os.path.basename(f))[0]}_insomnia.json")
-
-def main():
-    main_entry()
-
-if __name__ == "__main__":
-    main()
 
 def atomic_write(filename, data):
     """Write data to a file atomically to avoid partial writes."""
