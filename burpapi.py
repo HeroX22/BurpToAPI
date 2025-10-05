@@ -13,6 +13,32 @@ import logging
 
 SENSITIVE_KEYS = {"id", "user", "username", "userid", "email", "token", "session", "password", "auth", "key"}
 
+# --- New: sanitize logs to avoid leaking tokens/credentials ---
+def sanitize_for_logging(data: str) -> str:
+    """Remove sensitive data before logging."""
+    if not isinstance(data, str):
+        data = str(data)
+    sensitive_patterns = [
+        (r'((?:bearer)\s+)[\w\-\.=]+', r'\1[REDACTED]'),
+        (r'((?:password|pass)["\s:=]+)[\w\-\.=]+', r'\1[REDACTED]'),
+        (r'((?:token)["\s:=]+)[\w\-\.=]+', r'\1[REDACTED]'),
+        (r'(authorization:\s*)(?:[^\s]+)', r'\1[REDACTED]'),
+    ]
+    for pattern, replacement in sensitive_patterns:
+        data = re.sub(pattern, replacement, data, flags=re.IGNORECASE)
+    return data
+
+class SensitiveDataFilter(logging.Filter):
+    """Logging filter that sanitizes message text before output."""
+    def filter(self, record):
+        try:
+            record.msg = sanitize_for_logging(record.getMessage())
+            # avoid double-formatting issues by clearing args
+            record.args = ()
+        except Exception:
+            pass
+        return True
+
 def setup_logging(verbose: bool = False):
     """Setup logging configuration."""
     level = logging.DEBUG if verbose else logging.INFO
@@ -20,6 +46,18 @@ def setup_logging(verbose: bool = False):
         format="%(levelname)s: %(message)s",
         level=level
     )
+    # attach sanitizing filter globally
+    logging.getLogger().addFilter(SensitiveDataFilter())
+
+# --- New: safe path join to prevent path traversal when writing outputs ---
+def safe_join_path(folder: str, filename: str) -> str:
+    """Safely join folder + filename, disallowing traversal outside folder."""
+    safe_filename = os.path.basename(filename)
+    full_path = os.path.abspath(os.path.join(folder, safe_filename))
+    folder_abs = os.path.abspath(folder)
+    if not full_path.startswith(folder_abs + os.sep) and full_path != folder_abs:
+        raise ValueError("Invalid output path detected")
+    return full_path
 
 def decode_base64(data, is_base64):
     """Decode base64 data if necessary"""
@@ -452,9 +490,23 @@ def parse_burp_or_har(
                 item["headers"] = filter_headers(item["headers"], exclude_headers)
             items.append(item)
     else:
+        # Secure XML parsing: try defusedxml first, otherwise use XMLParser with entity protection
         try:
-            tree = ET.parse(input_file)
-            root = tree.getroot()
+            try:
+                from defusedxml import ElementTree as DefusedET  # type: ignore
+                tree = DefusedET.parse(input_file)
+                root = tree.getroot()
+            except Exception:
+                # Fallback to stdlib with limited entity support
+                parser = ET.XMLParser()
+                # Try to disable entity expansion where possible
+                try:
+                    parser.entity = {}  # type: ignore
+                except Exception:
+                    # best-effort; some python builds don't expose entity
+                    pass
+                tree = ET.parse(input_file, parser=parser)
+                root = tree.getroot()
         except Exception as e:
             logging.error(f"Error parsing XML file: {e}")
             return []
@@ -509,7 +561,7 @@ def build_postman_item(
     url = entry["url"]
     method = entry["method"]
     headers = entry["headers"]
-    body = entry["body"]
+    body = entry.get("body", "") if entry.get("body", "") is not None else ""
     status = entry.get("status", "")
     resp = entry.get("response", "")
     auth_vars = detect_auth_headers(headers)
@@ -547,28 +599,31 @@ def build_postman_item(
         pm_item["request"]["url"]["query"] = [
             {"key": k, "value": v[0]} for k, v in query_params.items()
         ]
-    # --- FIX: Always set body if present, even if empty string ---
-    if method not in ["GET", "HEAD"]:
-        content_type = headers.get("Content-Type", "")
-        if "application/json" in content_type and body:
-            try:
-                json_body = json.loads(body)
-                pm_item["request"]["body"] = {
-                    "mode": "raw",
-                    "raw": json.dumps(json_body, indent=2),
-                    "options": {"raw": {"language": "json"}}
-                }
-            except Exception:
-                pm_item["request"]["body"] = {"mode": "raw", "raw": body}
-        elif "application/x-www-form-urlencoded" in content_type and body:
+    # --- FIX: Always set body object for non-GET/HEAD methods; use empty string when body missing ---
+    if method.upper() not in ["GET", "HEAD"]:
+        content_type = headers.get("Content-Type", "") or headers.get("content-type", "")
+        if "application/json" in (content_type or "").lower():
+            if body:
+                try:
+                    json_body = json.loads(body)
+                    pm_item["request"]["body"] = {
+                        "mode": "raw",
+                        "raw": json.dumps(json_body, indent=2),
+                        "options": {"raw": {"language": "json"}}
+                    }
+                except Exception:
+                    pm_item["request"]["body"] = {"mode": "raw", "raw": body}
+            else:
+                pm_item["request"]["body"] = {"mode": "raw", "raw": ""}
+        elif "application/x-www-form-urlencoded" in (content_type or "").lower():
             form_data = []
-            for param in body.split('&'):
-                if '=' in param:
-                    key, value = param.split('=', 1)
-                    form_data.append({"key": key, "value": value})
+            if body:
+                for param in body.split('&'):
+                    if '=' in param:
+                        key, value = param.split('=', 1)
+                        form_data.append({"key": key, "value": value})
             pm_item["request"]["body"] = {"mode": "urlencoded", "urlencoded": form_data}
         else:
-            # Always set body, even if empty string, for POST/PUT/PATCH
             pm_item["request"]["body"] = {"mode": "raw", "raw": body if body is not None else ""}
     if resp:
         pm_item["response"] = [{
@@ -628,6 +683,7 @@ def xml_to_postman(
     }
     global_vars = {}
     duplicate_count = 0
+    seen_hashes = set()
 
     if pentest:
         # Folder: Pentest (dedup only here)
@@ -638,7 +694,7 @@ def xml_to_postman(
             if key in pentest_candidate_keys:
                 pm_item = build_postman_item(entry, global_vars, keep_path_id=True)
                 req_hash = generate_request_hash(
-                    entry["method"], entry["url"], entry["headers"], entry["body"]
+                    entry["method"], entry["url"], entry["headers"], entry.get("body", "")
                 )
                 if req_hash in pentest_hashes:
                     continue
@@ -671,13 +727,13 @@ def xml_to_postman(
             for entry in grouped.get("All", []) if "All" in grouped else [i for g in grouped.values() for i in g]:
                 pm_item = build_postman_item(entry, global_vars)
                 req_hash = generate_request_hash(
-                    entry["method"], entry["url"], entry["headers"], entry["body"]
+                    entry["method"], entry["url"], entry["headers"], entry.get("body", "")
                 )
-                if deduplicate and req_hash in duplicate_count:
+                if deduplicate and req_hash in seen_hashes:
                     duplicate_count += 1
                     continue
-                # Note: duplicate_count is an int, not a set, so this is a bug in original code.
-                # But for non-pentest mode, keep as is.
+                if deduplicate:
+                    seen_hashes.add(req_hash)
                 flat_items.append(pm_item)
             flat_items.sort(key=lambda x: (x["request"]["method"], "/".join(x["request"]["url"].get("path", []))))
             postman_collection["item"].extend(flat_items)
@@ -689,11 +745,13 @@ def xml_to_postman(
                 for entry in group_items:
                     pm_item = build_postman_item(entry, global_vars)
                     req_hash = generate_request_hash(
-                        entry["method"], entry["url"], entry["headers"], entry["body"]
+                        entry["method"], entry["url"], entry["headers"], entry.get("body", "")
                     )
-                    if deduplicate and req_hash in duplicate_count:
+                    if deduplicate and req_hash in seen_hashes:
                         duplicate_count += 1
                         continue
+                    if deduplicate:
+                        seen_hashes.add(req_hash)
                     pm_items.append(pm_item)
                 pm_items.sort(key=lambda x: (x["request"]["method"], "/".join(x["request"]["url"].get("path", []))))
                 if pm_items:
@@ -705,7 +763,11 @@ def xml_to_postman(
         base_name = os.path.splitext(os.path.basename(xml_file))[0]
         output_file = f"{base_name}_postman_collection.json"
     if output_folder:
-        output_file = os.path.join(output_folder, os.path.basename(output_file))
+        try:
+            output_file = safe_join_path(output_folder, output_file)
+        except Exception as e:
+            logging.error(f"Invalid output folder: {e}")
+            raise
     if update and os.path.exists(output_file):
         postman_collection = update_postman_collection(
             output_file,
