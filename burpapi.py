@@ -10,22 +10,38 @@ from urllib.parse import urlparse, parse_qs
 import glob
 from collections import defaultdict
 import logging
+from functools import lru_cache
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 SENSITIVE_KEYS = {"id", "user", "username", "userid", "email", "token", "session", "password", "auth", "key"}
 
-# --- New: sanitize logs to avoid leaking tokens/credentials ---
+# --- Replace sanitize_for_logging with stronger multi-layer sanitization ---
 def sanitize_for_logging(data: str) -> str:
-    """Remove sensitive data before logging."""
+    """Enhanced sanitization with multiple layers to reduce risk of leaking secrets."""
     if not isinstance(data, str):
         data = str(data)
+
+    # Layer 0: JWT tokens first (avoid them being partially redacted by base64 rule)
+    data = re.sub(r'eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]*\.[A-Za-z0-9_-]*', '[JWT_REDACTED]', data)
+
+    # Layer 1: Authorization: Bearer - keep scheme, redact token
+    data = re.sub(r'(?i)(authorization:\s*bearer\s+)[A-Za-z0-9\-\._~\+\/]+=*', r'\1[REDACTED]', data)
+
+    # Layer 2: Base64-like long strings (possible encoded secrets)
+    data = re.sub(r'\b[A-Za-z0-9+/]{40,}={0,2}\b', '[BASE64_REDACTED]', data)
+
+    # Layer 3: Known key/password patterns (case-insensitive)
     sensitive_patterns = [
-        (r'((?:bearer)\s+)[\w\-\.=]+', r'\1[REDACTED]'),
-        (r'((?:password|pass)["\s:=]+)[\w\-\.=]+', r'\1[REDACTED]'),
-        (r'((?:token)["\s:=]+)[\w\-\.=]+', r'\1[REDACTED]'),
-        (r'(authorization:\s*)(?:[^\s]+)', r'\1[REDACTED]'),
+        (r'((?:password|pass|pwd)["\s:=]+)[^\s\'"&]+', r'\1[REDACTED]', re.IGNORECASE),
+        (r'((?:bearer|token|key|auth)\s+)[\w\-\.=]+', r'\1[REDACTED]', re.IGNORECASE),
+    # General authorization fallback: redact remaining value but PRESERVE Bearer (negative lookahead)
+    # Ensure we don't match when optional whitespace is followed by 'bearer' (case-insensitive).
+    (r'(authorization:\s*)(?!\s*bearer\b)([^\n\r]+)', r'\1[REDACTED]', re.IGNORECASE),
     ]
-    for pattern, replacement in sensitive_patterns:
-        data = re.sub(pattern, replacement, data, flags=re.IGNORECASE)
+
+    for pattern, replacement, flags in sensitive_patterns:
+        data = re.sub(pattern, replacement, data, flags=flags)
+
     return data
 
 class SensitiveDataFilter(logging.Filter):
@@ -49,24 +65,47 @@ def setup_logging(verbose: bool = False):
     # attach sanitizing filter globally
     logging.getLogger().addFilter(SensitiveDataFilter())
 
-# --- New: safe path join to prevent path traversal when writing outputs ---
+# --- Enhanced safe_join_path: check original filename and reject traversal ---
 def safe_join_path(folder: str, filename: str) -> str:
-    """Safely join folder + filename, disallowing traversal outside folder."""
+    """Enhanced path traversal prevention. Rejects suspicious filenames and symlink escapes."""
+    # Reject suspicious input early (inspect original filename, not only basename)
+    if filename is None:
+        raise ValueError("Empty filename")
+    # Reject null bytes explicitly (treat as invalid)
+    if '\x00' in filename:
+        raise ValueError("Invalid filename")
+    norm = os.path.normpath(filename)
+    # Reject obvious traversal or absolute names or any path separators in provided filename
+    if norm.startswith(("..", "/", "\\")) or ".." in filename or any(sep in filename for sep in (os.sep, "/", "\\")):
+        raise ValueError("Suspicious filename detected")
     safe_filename = os.path.basename(filename)
-    full_path = os.path.abspath(os.path.join(folder, safe_filename))
-    folder_abs = os.path.abspath(folder)
+    # Remove null bytes and trim whitespace (already checked for nulls)
+    safe_filename = safe_filename.strip()
+    if safe_filename == '':
+        raise ValueError("Invalid filename")
+    full_path = os.path.realpath(os.path.join(folder, safe_filename))
+    folder_abs = os.path.realpath(folder)
     if not full_path.startswith(folder_abs + os.sep) and full_path != folder_abs:
-        raise ValueError("Invalid output path detected")
+        raise ValueError("Path traversal attempt detected")
     return full_path
 
+# --- Improved base64 decoding with validation; return original on invalid input ---
 def decode_base64(data, is_base64):
-    """Decode base64 data if necessary"""
-    if is_base64 == "true":
+    """Decode base64 data using validation and safe fallbacks."""
+    if is_base64 == "true" and data:
         try:
-            return base64.b64decode(data).decode('utf-8')
+            # validate=True will raise if input contains non-base64 chars
+            decoded = base64.b64decode(data, validate=True)
         except Exception as e:
-            print(f"Warning: Could not decode base64 data: {e}")
+            logging.warning(f"Base64 decode failed or invalid input: {e}")
             return data
+        # attempt decoding bytes using a list of encodings, but if none work return original decoded with replacement
+        for enc in ('utf-8', 'latin-1', 'cp1252'):
+            try:
+                return decoded.decode(enc)
+            except UnicodeDecodeError:
+                continue
+        return decoded.decode('utf-8', errors='replace')
     return data
 
 def parse_headers(raw_request):
@@ -178,7 +217,11 @@ def extract_variables_from_path(path):
             variables.append(var)
         else:
             new_segments.append(seg)
-    return "/".join(new_segments), variables
+    joined = "/".join(new_segments)
+    # Ensure leading slash in returned path (tests expect it)
+    if joined:
+        return f"/{joined}", variables
+    return "/", variables
 
 def group_by_path(items, mode="path_prefix"):
     """Group items by path prefix or domain."""
@@ -278,9 +321,12 @@ def is_sensitive_key(key: str) -> bool:
     """Check if a key is considered sensitive."""
     lkey = key.lower()
     return (
-        lkey in SENSITIVE_KEYS or
-        lkey.startswith("x-api") or
-        lkey.startswith("api-")
+        lkey in SENSITIVE_KEYS
+        or lkey.startswith("x-api")
+        or lkey.startswith("api-")
+        or lkey.startswith("api_")
+        or 'api_key' in lkey
+        or lkey.startswith("apikey")
     )
 
 def detect_pentest_candidates(items, filter_post_put=None):
@@ -465,6 +511,95 @@ def print_stats(items):
     print("By method:", dict(method_counter))
     print("By domain:", dict(domain_counter))
 
+def parse_xml_safely(input_file: str):
+    """Parse XML with comprehensive XXE protection (uses defusedxml if available)."""
+    try:
+        from defusedxml import ElementTree as DefusedET  # type: ignore
+        return DefusedET.parse(input_file)
+    except Exception:
+        # Stronger stdlib fallback with attempts to disable dangerous features
+        parser = ET.XMLParser()
+        # Try to disable entity expansion / external DTDs where supported
+        try:
+            parser.entity = {}  # type: ignore
+        except Exception:
+            pass
+        # Where possible, disable external entity resolution via underlying parser (best-effort)
+        try:
+            if hasattr(parser, 'parser') and hasattr(parser.parser, 'SetParamEntityParsing'):
+                parser.parser.SetParamEntityParsing(0)
+        except Exception:
+            pass
+        return ET.parse(input_file, parser=parser)
+
+# --- Streaming parser for very large Burp XMLs to reduce memory usage ---
+def parse_burp_xml_streaming(input_file: str):
+    """Stream-parse large Burp XML, yield items one by one."""
+    context = ET.iterparse(input_file, events=("end",))
+    # We don't need the root object permanently; free memory as we go.
+    for event, elem in context:
+        # handle both namespaced and plain 'item'
+        tag = elem.tag
+        if tag.endswith('item'):
+            try:
+                url_element = elem.find("url")
+                request_element = elem.find("request")
+                method_element = elem.find("method")
+                status_element = elem.find("status")
+                response_element = elem.find("response")
+                if url_element is None or request_element is None:
+                    elem.clear()
+                    continue
+                url = url_element.text
+                method = method_element.text if method_element is not None else "GET"
+                is_request_base64 = request_element.get("base64", "false")
+                raw_request = decode_base64(request_element.text or "", is_request_base64)
+                request_lines = raw_request.split('\n')
+                first_line = request_lines[0] if request_lines else ""
+                req_method, _ = parse_request_line(first_line)
+                if req_method:
+                    method = req_method
+                headers = parse_headers(raw_request)
+                body = extract_request_body(raw_request)
+                status = status_element.text if status_element is not None else ""
+                resp = decode_base64(response_element.text or "", response_element.get("base64", "false")) if response_element is not None else ""
+                yield {
+                    "url": url,
+                    "method": method,
+                    "headers": headers,
+                    "body": body,
+                    "status": status,
+                    "response": resp
+                }
+            except Exception as e:
+                logging.debug(f"Error processing streaming item: {e}")
+            finally:
+                # Clear to free memory
+                elem.clear()
+
+# --- Cached hash generator to speed up deduplication (optional) ---
+@lru_cache(maxsize=10000)
+def generate_request_hash_cached(method, url, headers_tuple, body):
+    """Cached wrapper for generate_request_hash."""
+    headers = dict(headers_tuple)
+    return generate_request_hash(method, url, headers, body)
+
+# --- Optional: process multiple files in parallel (small helper) ---
+def parse_multiple_files_parallel(files, max_workers=None):
+    """Parse multiple files in parallel, returning dict filename->items."""
+    max_workers = max_workers or (os.cpu_count() or 2)
+    results = {}
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = {ex.submit(parse_burp_or_har, f): f for f in files}
+        for fut in as_completed(futures):
+            fname = futures[fut]
+            try:
+                results[fname] = fut.result()
+            except Exception as e:
+                logging.error(f"Error parsing {fname}: {e}")
+                results[fname] = []
+    return results
+
 def parse_burp_or_har(
     input_file: str,
     input_type: str = None,
@@ -472,8 +607,6 @@ def parse_burp_or_har(
     show_progress: bool = False
 ) -> list:
     """Parse Burp XML or HAR file and return list of request items."""
-    if not input_type:
-        input_type = auto_detect_input_type(input_file)
     items = []
     tqdm = None
     if show_progress:
@@ -490,77 +623,83 @@ def parse_burp_or_har(
                 item["headers"] = filter_headers(item["headers"], exclude_headers)
             items.append(item)
     else:
-        # Secure XML parsing: try defusedxml first, otherwise use XMLParser with entity protection
+        # For large files, prefer streaming to reduce memory usage
         try:
-            try:
-                from defusedxml import ElementTree as DefusedET  # type: ignore
-                tree = DefusedET.parse(input_file)
+            size = os.path.getsize(input_file)
+        except Exception:
+            size = 0
+        try:
+            if size > 50 * 1024 * 1024:  # >50MB -> streaming
+                xml_iter = parse_burp_xml_streaming(input_file)
+                progress_iter = tqdm(xml_iter, desc="Streaming XML") if tqdm else xml_iter
+                for it in progress_iter:
+                    if exclude_headers:
+                        it["headers"] = filter_headers(it["headers"], exclude_headers)
+                    items.append(it)
+            else:
+                # Use safe parser (defusedxml preferred)
+                tree = parse_xml_safely(input_file)
                 root = tree.getroot()
-            except Exception:
-                # Fallback to stdlib with limited entity support
-                parser = ET.XMLParser()
-                # Try to disable entity expansion where possible
-                try:
-                    parser.entity = {}  # type: ignore
-                except Exception:
-                    # best-effort; some python builds don't expose entity
-                    pass
-                tree = ET.parse(input_file, parser=parser)
-                root = tree.getroot()
+                xml_items = root.findall(".//item")
+                progress_iter = tqdm(xml_items, desc="Parsing XML") if tqdm else xml_items
+                for item in progress_iter:
+                    url_element = item.find("url")
+                    method_element = item.find("method")
+                    request_element = item.find("request")
+                    status_element = item.find("status")
+                    response_element = item.find("response")
+                    if url_element is None or request_element is None:
+                        return
+                    url = url_element.text
+                    method = method_element.text if method_element is not None else "GET"
+                    is_request_base64 = request_element.get("base64", "false")
+                    raw_request = decode_base64(request_element.text or "", is_request_base64)
+                    request_lines = raw_request.split('\n')
+                    first_line = request_lines[0] if request_lines else ""
+                    req_method, _ = parse_request_line(first_line)
+                    if req_method:
+                        method = req_method
+                    headers = parse_headers(raw_request)
+                    if exclude_headers:
+                        headers = filter_headers(headers, exclude_headers)
+                    body = extract_request_body(raw_request)
+                    status = status_element.text if status_element is not None else ""
+                    resp = decode_base64(response_element.text or "", response_element.get("base64", "false")) if response_element is not None else ""
+                    items.append({
+                        "url": url,
+                        "method": method,
+                        "headers": headers,
+                        "body": body,
+                        "status": status,
+                        "response": resp
+                    })
         except Exception as e:
             logging.error(f"Error parsing XML file: {e}")
             return []
-        xml_items = root.findall(".//item")
-        progress_iter = tqdm(xml_items, desc="Parsing XML") if tqdm else xml_items
-        for item in progress_iter:
-            url_element = item.find("url")
-            method_element = item.find("method")
-            request_element = item.find("request")
-            status_element = item.find("status")
-            response_element = item.find("response")
-            if url_element is None or request_element is None:
-                continue
-            url = url_element.text
-            method = method_element.text if method_element is not None else "GET"
-            is_request_base64 = request_element.get("base64", "false")
-            raw_request = decode_base64(request_element.text, is_request_base64)
-            request_lines = raw_request.split('\n')
-            first_line = request_lines[0] if request_lines else ""
-            req_method, _ = parse_request_line(first_line)
-            if req_method:
-                method = req_method
-            headers = parse_headers(raw_request)
-            if exclude_headers:
-                headers = filter_headers(headers, exclude_headers)
-            body = extract_request_body(raw_request)
-            status = status_element.text if status_element is not None else ""
-            resp = decode_base64(response_element.text, response_element.get("base64", "false")) if response_element is not None else ""
-            items.append({
-                "url": url,
-                "method": method,
-                "headers": headers,
-                "body": body,
-                "status": status,
-                "response": resp
-            })
     return items
 
+# --- Restore a small global helper for folder ordering (used by xml_to_postman) ---
 def get_sorted_folders(grouped: dict, group_mode: str) -> list:
     """Return sorted folder/group keys for consistent order."""
     if group_mode == "flat":
         return ["All"]
-    return sorted(grouped.keys())
+    keys = sorted(grouped.keys())
+    # keep 'root' first if present
+    if "root" in keys:
+        keys.remove("root")
+        return ["root"] + keys
+    return keys
 
+# --- Restore a global build_postman_item to avoid local/unbound issues and keep body handling consistent ---
 def build_postman_item(
     entry: dict,
     global_vars: dict,
     keep_path_id: bool = False
 ) -> dict:
-    """Build a Postman item from entry and update global_vars.
-    If keep_path_id=True, do not convert numeric/uuid path segments to :id."""
-    url = entry["url"]
-    method = entry["method"]
-    headers = entry["headers"]
+    """Build a Postman item from entry and update global_vars."""
+    url = entry.get("url", "")
+    method = entry.get("method", "GET")
+    headers = entry.get("headers", {}) or {}
     body = entry.get("body", "") if entry.get("body", "") is not None else ""
     status = entry.get("status", "")
     resp = entry.get("response", "")
@@ -570,7 +709,6 @@ def build_postman_item(
         global_vars.update({f"cookie_{k}": v for k, v in cookies.items()})
     global_vars.update(auth_vars)
     parsed_url = urlparse(url)
-    # Path handling
     if keep_path_id:
         path = parsed_url.path
         path_list = path.strip('/').split('/') if path else []
@@ -578,7 +716,7 @@ def build_postman_item(
         path, _ = extract_variables_from_path(parsed_url.path)
         path_list = path.strip('/').split('/') if path else []
     protocol = parsed_url.scheme
-    host = parsed_url.netloc.split('.')
+    host = parsed_url.netloc.split('.') if parsed_url.netloc else []
     query = parsed_url.query
     pm_item = {
         "name": f"{method} {parsed_url.path}",
@@ -599,10 +737,10 @@ def build_postman_item(
         pm_item["request"]["url"]["query"] = [
             {"key": k, "value": v[0]} for k, v in query_params.items()
         ]
-    # --- FIX: Always set body object for non-GET/HEAD methods; use empty string when body missing ---
+    # Always set body object for non-GET/HEAD methods; use empty string when body missing
     if method.upper() not in ["GET", "HEAD"]:
-        content_type = headers.get("Content-Type", "") or headers.get("content-type", "")
-        if "application/json" in (content_type or "").lower():
+        content_type = headers.get("Content-Type", "") or headers.get("content-type", "") or ""
+        if "application/json" in content_type.lower():
             if body:
                 try:
                     json_body = json.loads(body)
@@ -615,7 +753,7 @@ def build_postman_item(
                     pm_item["request"]["body"] = {"mode": "raw", "raw": body}
             else:
                 pm_item["request"]["body"] = {"mode": "raw", "raw": ""}
-        elif "application/x-www-form-urlencoded" in (content_type or "").lower():
+        elif "application/x-www-form-urlencoded" in content_type.lower():
             form_data = []
             if body:
                 for param in body.split('&'):
@@ -702,79 +840,50 @@ def xml_to_postman(
                 pentest_folder["item"].append(pm_item)
         pentest_folder["item"].sort(key=lambda x: (x["request"]["method"], "/".join(x["request"]["url"].get("path", []))))
         postman_collection["item"].append(pentest_folder)
-        # Folder: API/grouped (semua endpoint, tidak dedup)
-        sorted_folders = get_sorted_folders(grouped, group_mode)
-        if group_mode == "flat":
-            api_folder = {"name": "API", "item": []}
-            for entry in grouped.get("All", []) if "All" in grouped else [i for g in grouped.values() for i in g]:
-                pm_item = build_postman_item(entry, global_vars, keep_path_id=True)
-                api_folder["item"].append(pm_item)
-            api_folder["item"].sort(key=lambda x: (x["request"]["method"], "/".join(x["request"]["url"].get("path", []))))
-            postman_collection["item"].append(api_folder)
-        else:
-            for folder in sorted_folders:
-                group_items = grouped[folder]
-                folder_item = {"name": folder, "item": []}
-                for entry in group_items:
-                    pm_item = build_postman_item(entry, global_vars, keep_path_id=True)
-                    folder_item["item"].append(pm_item)
-                folder_item["item"].sort(key=lambda x: (x["request"]["method"], "/".join(x["request"]["url"].get("path", []))))
-                postman_collection["item"].append(folder_item)
+
+    # Folder: API/grouped (semua endpoint, tidak dedup)
+    sorted_folders = get_sorted_folders(grouped, group_mode)
+    if group_mode == "flat":
+        api_folder = {"name": "API", "item": []}
+        for entry in grouped.get("All", []) if "All" in grouped else [i for g in grouped.values() for i in g]:
+            pm_item = build_postman_item(entry, global_vars, keep_path_id=True)
+            api_folder["item"].append(pm_item)
+        api_folder["item"].sort(key=lambda x: (x["request"]["method"], "/".join(x["request"]["url"].get("path", []))))
+        postman_collection["item"].append(api_folder)
     else:
-        sorted_folders = get_sorted_folders(grouped, group_mode)
-        if group_mode == "flat":
-            flat_items = []
-            for entry in grouped.get("All", []) if "All" in grouped else [i for g in grouped.values() for i in g]:
-                pm_item = build_postman_item(entry, global_vars)
-                req_hash = generate_request_hash(
-                    entry["method"], entry["url"], entry["headers"], entry.get("body", "")
-                )
-                if deduplicate and req_hash in seen_hashes:
-                    duplicate_count += 1
-                    continue
-                if deduplicate:
-                    seen_hashes.add(req_hash)
-                flat_items.append(pm_item)
-            flat_items.sort(key=lambda x: (x["request"]["method"], "/".join(x["request"]["url"].get("path", []))))
-            postman_collection["item"].extend(flat_items)
-        else:
-            for folder in sorted_folders:
-                group_items = grouped[folder]
-                folder_item = {"name": folder, "item": []}
-                pm_items = []
-                for entry in group_items:
-                    pm_item = build_postman_item(entry, global_vars)
-                    req_hash = generate_request_hash(
-                        entry["method"], entry["url"], entry["headers"], entry.get("body", "")
-                    )
-                    if deduplicate and req_hash in seen_hashes:
-                        duplicate_count += 1
-                        continue
-                    if deduplicate:
-                        seen_hashes.add(req_hash)
-                    pm_items.append(pm_item)
-                pm_items.sort(key=lambda x: (x["request"]["method"], "/".join(x["request"]["url"].get("path", []))))
-                if pm_items:
-                    folder_item["item"] = pm_items
-                    postman_collection["item"].append(folder_item)
+        for folder in sorted_folders:
+            group_items = grouped[folder]
+            folder_item = {"name": folder, "item": []}
+            for entry in group_items:
+                pm_item = build_postman_item(entry, global_vars, keep_path_id=True)
+                folder_item["item"].append(pm_item)
+            folder_item["item"].sort(key=lambda x: (x["request"]["method"], "/".join(x["request"]["url"].get("path", []))))
+            postman_collection["item"].append(folder_item)
     if global_vars:
         postman_collection["variable"] = [{"key": k, "value": v} for k, v in global_vars.items()]
     if output_file is None:
         base_name = os.path.splitext(os.path.basename(xml_file))[0]
         output_file = f"{base_name}_postman_collection.json"
+    # If output_folder provided, get safe path
     if output_folder:
         try:
             output_file = safe_join_path(output_folder, output_file)
         except Exception as e:
             logging.error(f"Invalid output folder: {e}")
             raise
+    # If update requested and existing file exists, merge items then write
     if update and os.path.exists(output_file):
         postman_collection = update_postman_collection(
             output_file,
             [i for f in postman_collection["item"] for i in (f["item"] if "item" in f else [f])]
         )
-    with open(output_file, 'w', encoding='utf-8') as f:
-        json.dump(postman_collection, f, indent=2)
+    # Write atomically (use the atomic_write helper)
+    try:
+        json_text = json.dumps(postman_collection, indent=2)
+        atomic_write(output_file, json_text)
+    except Exception as e:
+        logging.error(f"Failed to write output file: {e}")
+        raise
     print(f"Successfully converted to Postman collection: {output_file}")
     return output_file
 
@@ -793,13 +902,10 @@ def xml_to_openapi(
         for item in parse_har_file(xml_file):
             items.append(item)
     else:
-        try:
-            tree = ET.parse(xml_file)
-            root = tree.getroot()
-        except Exception as e:
-            logging.error(f"Error parsing XML file: {e}")
-            return
-        for item in root.findall(".//item"):
+        tree = parse_xml_safely(xml_file)
+        root = tree.getroot()
+        xml_items = root.findall(".//item")
+        for item in xml_items:
             url_element = item.find("url")
             method_element = item.find("method")
             request_element = item.find("request")
@@ -810,7 +916,7 @@ def xml_to_openapi(
             url = url_element.text
             method = method_element.text if method_element is not None else "GET"
             is_request_base64 = request_element.get("base64", "false")
-            raw_request = decode_base64(request_element.text, is_request_base64)
+            raw_request = decode_base64(request_element.text or "", is_request_base64)
             request_lines = raw_request.split('\n')
             first_line = request_lines[0] if request_lines else ""
             req_method, req_path = parse_request_line(first_line)
@@ -819,7 +925,7 @@ def xml_to_openapi(
             headers = parse_headers(raw_request)
             body = extract_request_body(raw_request)
             status = status_element.text if status_element is not None else ""
-            resp = decode_base64(response_element.text, response_element.get("base64", "false")) if response_element is not None else ""
+            resp = decode_base64(response_element.text or "", response_element.get("base64", "false")) if response_element is not None else ""
             items.append({
                 "url": url,
                 "method": method,
@@ -852,8 +958,8 @@ def xml_to_openapi(
         for entry in group_items:
             url = entry["url"]
             method = entry["method"].lower()
-            headers = entry["headers"]
-            body = entry["body"]
+            headers = entry.get("headers", {}) or {}
+            body = entry.get("body", "")
             status = entry.get("status", "")
             resp = entry.get("response", "")
             parsed_url = urlparse(url)
@@ -862,8 +968,10 @@ def xml_to_openapi(
                 servers.add(server_url)
                 openapi_spec["servers"].append({"url": server_url})
             path, path_vars = extract_variables_from_path(parsed_url.path)
-            # Path variable OpenAPI
-            openapi_path = "/" + re.sub(r":(\w+)", r"{\1}", path)
+            # Path variable OpenAPI: replace :var with {var} but avoid double-leading slashes
+            openapi_path = re.sub(r":(\w+)", r"{\1}", path)
+            if not openapi_path.startswith("/"):
+                openapi_path = "/" + openapi_path
             if openapi_path not in openapi_spec["paths"]:
                 openapi_spec["paths"][openapi_path] = {}
             parameters = []
@@ -884,7 +992,7 @@ def xml_to_openapi(
                         "schema": {"type": "string"},
                         "example": param_values[0] if param_values else ""
                     })
-            content_type = headers.get("Content-Type", "")
+            content_type = headers.get("Content-Type", headers.get("content-type", "")) or ""
             request_body = None
             if method not in ["get", "head"] and body:
                 if "application/json" in content_type:
@@ -898,7 +1006,7 @@ def xml_to_openapi(
                                 }
                             }
                         }
-                    except:
+                    except Exception:
                         request_body = {
                             "content": {
                                 "text/plain": {
@@ -940,14 +1048,35 @@ def xml_to_openapi(
             if request_body:
                 path_item["requestBody"] = request_body
             openapi_spec["paths"][openapi_path][method] = path_item
+
+    # Finalize tags and write output file atomically
     openapi_spec["tags"] = [{"name": t} for t in tag_set]
     if output_file is None:
         base_name = os.path.splitext(os.path.basename(xml_file))[0]
         output_file = f"{base_name}_openapi.json"
-    with open(output_file, 'w', encoding='utf-8') as f:
-        json.dump(openapi_spec, f, indent=2)
+    try:
+        json_text = json.dumps(openapi_spec, indent=2)
+        atomic_write(output_file, json_text)
+    except Exception as e:
+        logging.error(f"Failed to write OpenAPI file: {e}")
+        raise
     print(f"Successfully converted to OpenAPI specification: {output_file}")
     return output_file
+
+def atomic_write(filename, data):
+    """Write data to a file atomically to avoid partial writes."""
+    import tempfile
+    import shutil
+    dir_name = os.path.dirname(os.path.abspath(filename)) or "."
+    with tempfile.NamedTemporaryFile("w", dir=dir_name, delete=False, encoding="utf-8") as tf:
+        tf.write(data)
+        tempname = tf.name
+    try:
+        shutil.move(tempname, filename)
+    except Exception:
+        os.remove(tempname)
+        raise
+
 
 def initialize_environment():
     """Check for required libraries and validate the environment."""
@@ -1078,6 +1207,161 @@ if __name__ == "__main__":
 #    python burpapi.py hasil.xml --format postman
 #
 # 7. Deteksi pentest dan simpan ke file:
+#    python burpapi.py hasil.xml --pentest --pentest-output candidates.json
+#
+# Lihat --help untuk opsi lengkap:
+#    python burpapi.py --help
+# -------------------------------
+
+def atomic_write(filename, data):
+    """Write data to a file atomically to avoid partial writes."""
+    import tempfile
+    import shutil
+    dir_name = os.path.dirname(os.path.abspath(filename)) or "."
+    with tempfile.NamedTemporaryFile("w", dir=dir_name, delete=False, encoding="utf-8") as tf:
+        tf.write(data)
+        tempname = tf.name
+    try:
+        shutil.move(tempname, filename)
+    except Exception:
+        os.remove(tempname)
+        raise
+
+
+def initialize_environment():
+    """Check for required libraries and validate the environment."""
+    missing_libraries = []
+    try:
+        import tabulate  # Check if tabulate is installed
+    except ImportError:
+        missing_libraries.append("tabulate")
+
+    if missing_libraries:
+        print("Warning: The following libraries are missing:")
+        for lib in missing_libraries:
+            print(f"  - {lib}")
+        print("You can install them using:")
+        print(f"  pip install {' '.join(missing_libraries)}")
+    
+    # Check Python version
+    import sys
+    if sys.version_info < (3, 6):
+        print("Error: Python 3.6 or higher is required to run this script.")
+        sys.exit(1)
+
+    # Check if required directories or files exist (if applicable)
+    print("Environment initialized successfully.")
+
+def main_entry():
+    """Entry point for CLI and import."""
+    parser = argparse.ArgumentParser(description="Convert Burp Suite XML/HAR to Postman, OpenAPI, or Insomnia")
+    parser.add_argument("--check-env", action="store_true", help="Check environment for required libraries and Python version")
+    parser.add_argument("input_file", nargs="*", help="Input Burp Suite XML/HAR file(s) (wildcard supported)")
+    parser.add_argument("--format", choices=["postman", "openapi", "insomnia"], default="postman", help="Output format")
+    parser.add_argument("--output", help="Output file name (default: auto-generated based on input file)")
+    parser.add_argument("--output-folder", help="Output folder for result files")
+    parser.add_argument("--no-deduplicate", dest="deduplicate", action="store_false", help="Disable deduplication")
+    parser.add_argument("--group", choices=["domain", "path_prefix", "flat"], default="path_prefix", help="Grouping mode")
+    parser.add_argument("--input-type", choices=["xml", "har"], help="Input file type (auto-detect if not set)")
+    parser.add_argument("--update", action="store_true", help="Update existing collection instead of overwrite")
+    parser.add_argument("--pentest", action="store_true", help="Detect potentially weak endpoints for pentest")
+    parser.add_argument("--pentest-output", help="Save pentest candidates to file (JSON, CSV, or TXT)")
+    parser.add_argument("--pentest-table", action="store_true", help="Show pentest candidates as table (requires tabulate)")
+    parser.add_argument("--exclude-header", action="append", help="Header(s) to exclude from export (repeatable)", default=[])
+    parser.add_argument("--collection-title", help="Custom title/name for the collection")
+    parser.add_argument("--show-stats", action="store_true", help="Show summary statistics of endpoints")
+    parser.add_argument("--show-progress", action="store_true", help="Show progress bar (requires tqdm)")
+    parser.add_argument("--verbose", action="store_true", help="Enable verbose/debug logging")
+    parser.set_defaults(deduplicate=True)
+    args = parser.parse_args()
+
+    if args.check_env:
+        initialize_environment()
+        return  # Exit after environment check if the flag is used
+
+    if not args.input_file:
+        parser.error("the following arguments are required: input_file")
+
+    setup_logging(args.verbose)
+    files = []
+    for pattern in args.input_file:
+        files.extend(glob.glob(pattern))
+    for f in files:
+        if not os.path.isfile(f):
+            logging.error(f"Input file not found: {f}")
+            continue
+        if args.format == "postman":
+            xml_to_postman(
+                f, args.output, args.deduplicate, group_mode=args.group,
+                update=args.update, input_type=args.input_type,
+                pentest=args.pentest, pentest_output=args.pentest_output,
+                pentest_table=args.pentest_table,
+                exclude_headers=[h.lower() for h in args.exclude_header] if args.exclude_header else None,
+                output_folder=args.output_folder,
+                collection_title=args.collection_title,
+                show_stats=args.show_stats,
+                show_progress=args.show_progress
+            )
+        elif args.format == "openapi":
+            xml_to_openapi(
+                f, args.output, args.deduplicate, group_mode=args.group,
+                input_type=args.input_type or auto_detect_input_type(f), pentest=args.pentest,
+                pentest_table=args.pentest_table
+            )
+        elif args.format == "insomnia":
+            pm_file = xml_to_postman(
+                f, None, args.deduplicate, group_mode=args.group,
+                input_type=args.input_type or auto_detect_input_type(f), pentest=args.pentest,
+                pentest_table=args.pentest_table,
+                exclude_headers=[h.lower() for h in args.exclude_header] if args.exclude_header else None,
+                output_folder=args.output_folder,
+                collection_title=args.collection_title,
+                show_stats=args.show_stats,
+                show_progress=args.show_progress
+            )
+            with open(pm_file, "r", encoding="utf-8") as pf:
+                pm = json.load(pf)
+            items = []
+            for folder in pm.get("item", []):
+                if "item" in folder:
+                    items.extend(folder["item"])
+                else:
+                    items.append(folder)
+            export_insomnia(items, args.output or f"{os.path.splitext(os.path.basename(f))[0]}_insomnia.json")
+
+def main():
+    main_entry()
+
+if __name__ == "__main__":
+    main()
+
+# -------------------------------
+# Contoh Penggunaan:
+#
+# 1. Konversi satu file XML Burp ke Postman, otomatis folder per prefix path:
+#    python burpapi.py hasil.xml --format postman
+#
+# 2. Konversi beberapa file sekaligus (wildcard), hasilkan OpenAPI, group per domain:
+#    python burpapi.py hasil*.xml --format openapi --group domain
+#
+# 3. Import file HAR dan ekspor ke Insomnia:
+#    python burpapi.py traffic.har --input-type har --format insomnia
+#
+# 4. Update koleksi Postman yang sudah ada:
+#    python burpapi.py hasil.xml --format postman --update --output koleksi.json
+#
+# 5. Group flat (semua endpoint dalam satu folder):
+#    python burpapi.py hasil.xml --group flat
+#
+# 6. Konversi dengan variabel header/token otomatis:
+#    python burpapi.py hasil.xml --format postman
+#
+# 7. Deteksi pentest dan simpan ke file:
+#    python burpapi.py hasil.xml --pentest --pentest-output candidates.json
+#
+# Lihat --help untuk opsi lengkap:
+#    python burpapi.py --help
+# -------------------------------
 #    python burpapi.py hasil.xml --pentest --pentest-output candidates.json
 #
 # Lihat --help untuk opsi lengkap:
